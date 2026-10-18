@@ -1,0 +1,6 @@
+name = "widgets"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "widgets"
+database_id = "d1-widgets-id"

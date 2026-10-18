@@ -1,0 +1,52 @@
+{
+  "description": "TableStudio: database context when a session starts, a guard on shell commands that write to remote or production databases, a reminder to check new migrations against real data, and which chat made each TableStudio call (for its Agent Center).",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/bash \"${PLUGIN_ROOT}/scripts/tablestudio-hook\" session-start codex",
+            "timeout": 15,
+            "statusMessage": "Checking TableStudio"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/bash \"${PLUGIN_ROOT}/scripts/tablestudio-hook\" guard-shell codex",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/bash \"${PLUGIN_ROOT}/scripts/tablestudio-hook\" agent-event codex",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|apply_patch|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/bash \"${PLUGIN_ROOT}/scripts/tablestudio-hook\" after-tool codex",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

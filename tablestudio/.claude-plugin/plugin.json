@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "tablestudio",
+  "displayName": "TableStudio",
+  "version": "0.4.0",
+  "description": "Your coding agent works on your databases through the TableStudio app: it knows which saved connection each of the repo's databases is, dry-runs writes against real rows, checks new migrations against real data, stages risky changes for your review, and is stopped from writing to production from the shell. No token to copy.",
+  "author": {
+    "name": "TableStudio",
+    "url": "https://tablestudio.sh"
+  },
+  "homepage": "https://tablestudio.sh",
+  "repository": "https://github.com/tablestudioapp/plugins",
+  "license": "MIT",
+  "keywords": [
+    "database",
+    "postgres",
+    "mysql",
+    "sqlite",
+    "clickhouse",
+    "d1",
+    "mcp",
+    "migrations",
+    "sql"
+  ],
+  "icon": "./assets/icon.png",
+  "documentationUrl": "https://github.com/tablestudioapp/plugins#readme",
+  "supportUrl": "https://github.com/tablestudioapp/plugins/issues",
+  "userConfig": {
+    "port": {
+      "type": "number",
+      "title": "TableStudio MCP port",
+      "description": "The port shown in TableStudio's Settings → MCP. Leave as 7432 unless you changed it there.",
+      "default": 7432,
+      "min": 1024,
+      "max": 65535
+    },
+    "guard_mode": {
+      "type": "string",
+      "title": "Shell guard",
+      "description": "What to do when the agent runs a shell command that writes to a non-local database. standard: block production, ask for other remote databases. ask: always ask. off: don't check.",
+      "default": "standard"
+    }
+  }
+}

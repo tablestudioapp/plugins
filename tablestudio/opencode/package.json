@@ -1,0 +1,13 @@
+{
+  "name": "opencode-tablestudio",
+  "version": "0.4.0",
+  "description": "TableStudio for OpenCode: safe database work through the TableStudio app.",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/tablestudioapp/plugins",
+  "keywords": ["opencode", "opencode-plugin", "database", "postgres", "mysql", "sqlite", "mcp"]
+}

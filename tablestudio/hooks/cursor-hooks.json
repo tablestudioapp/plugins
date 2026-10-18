@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "bash \"${CURSOR_PLUGIN_ROOT}/scripts/tablestudio-hook\" session-start cursor",
+        "timeout": 15
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": "bash \"${CURSOR_PLUGIN_ROOT}/scripts/tablestudio-hook\" guard-shell cursor",
+        "matcher": "psql|mysql|mariadb|pg_restore|clickhouse|prisma|drizzle|supabase|rails|rake|manage\\.py|alembic|artisan|knex|sequelize|wrangler|turso|flyway|goose|dbmate|migrat|sqlx|atlas|seed|db:",
+        "timeout": 10
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "bash \"${CURSOR_PLUGIN_ROOT}/scripts/tablestudio-hook\" after-tool cursor",
+        "matcher": "Write|Shell",
+        "timeout": 10
+      }
+    ],
+    "afterMCPExecution": [
+      {
+        "command": "bash \"${CURSOR_PLUGIN_ROOT}/scripts/tablestudio-hook\" agent-event cursor",
+        "timeout": 5
+      }
+    ]
+  }
+}

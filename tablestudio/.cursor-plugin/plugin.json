@@ -1,0 +1,34 @@
+{
+  "name": "tablestudio",
+  "displayName": "TableStudio",
+  "version": "0.4.0",
+  "description": "Your coding agent works on your databases through the TableStudio app: it knows which saved connection each of the repo's databases is, dry-runs writes against real rows, checks new migrations against real data, stages risky changes for your review, and is stopped from writing to production from the shell.",
+  "author": {
+    "name": "TableStudio"
+  },
+  "homepage": "https://tablestudio.sh",
+  "repository": "https://github.com/tablestudioapp/plugins",
+  "license": "MIT",
+  "logo": "assets/icon.png",
+  "keywords": [
+    "database",
+    "postgres",
+    "mysql",
+    "sqlite",
+    "clickhouse",
+    "mcp",
+    "migrations",
+    "sql"
+  ],
+  "category": "developer-tools",
+  "tags": [
+    "database",
+    "sql",
+    "migrations",
+    "safety"
+  ],
+  "skills": "./skills/",
+  "rules": "./rules/",
+  "hooks": "./hooks/cursor-hooks.json",
+  "mcpServers": "./cursor-mcp.json"
+}

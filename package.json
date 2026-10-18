@@ -1,0 +1,22 @@
+{
+  "name": "opencode-tablestudio",
+  "version": "0.4.0",
+  "description": "TableStudio for OpenCode: your agent works on your databases through the TableStudio app, with read-only checks, dry runs and a review inbox for risky changes.",
+  "type": "module",
+  "main": "./tablestudio/opencode/index.js",
+  "exports": {
+    ".": "./tablestudio/opencode/index.js"
+  },
+  "files": [
+    "tablestudio/opencode",
+    "tablestudio/scripts",
+    "tablestudio/skills"
+  ],
+  "license": "MIT",
+  "homepage": "https://tablestudio.sh",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tablestudioapp/plugins.git"
+  },
+  "keywords": ["opencode", "opencode-plugin", "database", "postgres", "mysql", "sqlite", "mcp", "tablestudio"]
+}

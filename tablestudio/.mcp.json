@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "tablestudio": {
+      "type": "http",
+      "url": "http://localhost:${user_config.port}",
+      "headersHelper": "/bin/bash \"${CLAUDE_PLUGIN_ROOT}/scripts/tablestudio-hook\" mcp-headers"
+    }
+  }
+}

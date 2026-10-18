@@ -1,0 +1,1612 @@
+#!/bin/bash
+# TableStudio agent hook, shared by the Claude Code, Cursor, Codex and OpenCode plugins.
+#
+#   tablestudio-hook session-start <claude|cursor|codex>
+#       Adds a short "database context" note when a session starts: the repo's database settings
+#       (credentials stripped) and the saved TableStudio connection behind each, the migration tool
+#       that owns the schema, and whether TableStudio's tools are available, with the fix when
+#       they aren't. Opens TableStudio in the background when it's closed. Prints nothing in repos
+#       with no database signals.
+#
+#   tablestudio-hook guard-shell <claude|cursor|codex>
+#       Checks a shell command before it runs. Database writes to a production target are blocked,
+#       writes to other non-local databases ask the user first, and everything else (reads, local
+#       databases, unrelated commands) passes. The first time a session runs psql, mysql or sqlite3
+#       directly, the agent is pointed at TableStudio's tools instead.
+#
+#   tablestudio-hook after-tool <claude|cursor|codex>
+#       After the agent writes a migration or runs a migration generator, reminds it (once per
+#       session) to check the migration against the real database's data with TableStudio.
+#
+#   tablestudio-hook mcp-headers
+#       Claude Code's headersHelper: prints TableStudio's MCP Authorization header, read from the
+#       app's own settings, so nobody has to copy a token. Opens TableStudio when it's closed.
+#
+#   tablestudio-hook connect-cursor
+#       Opens Cursor's install prompt for TableStudio's MCP server. The user confirms it in Cursor.
+#
+#   tablestudio-hook mcp-stdio <client>
+#       An MCP stdio server that forwards to TableStudio's local HTTP server, reading the token from
+#       the app for every message. For clients that launch a command but can't compute a header.
+#
+#   tablestudio-hook agent-event <client>
+#       Tells TableStudio which chat made a tool call (from the client's hook payload), so its Agent
+#       Center can group activity by conversation. Fire and forget.
+#
+#   tablestudio-hook install [claude|cursor|codex|opencode]…
+#       Installs the plugin into each agent (every one found when none are named), then runs doctor.
+#
+#   tablestudio-hook doctor
+#       Checks TableStudio's MCP server and each agent's setup, with the fix for anything missing.
+#
+# Hook events arrive as JSON on stdin. It needs only what ships with macOS: bash 3.2, grep, sed,
+# curl, plutil, defaults and osascript (jq is used instead of plutil where plutil doesn't exist).
+#
+# It fails open: if anything here goes wrong, the command runs as if the hook weren't installed.
+# A broken safety net must never take away the user's shell.
+
+EVENT="${1:-}"
+CLIENT="${2:-claude}"
+INPUT=""
+# Only hook events carry JSON on stdin. headersHelper and connect-cursor may have a terminal (or
+# nothing that ever closes) there, so reading it would hang.
+case "$EVENT" in session-start | guard-shell | after-tool | agent-event) INPUT="$(cat 2>/dev/null)" ;; esac
+
+DEFAULT_PORT=7432
+MAX_SQL_FILE_BYTES=1048576
+APP_BUNDLE_ID="sh.tablestudio"
+TAB="$(printf '\t')"
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+# ---------------------------------------------------------------------------------------------
+# Plumbing
+# ---------------------------------------------------------------------------------------------
+
+# json_get <key.path> — a string field from the event JSON, or nothing.
+json_get() {
+    local value
+    if [ -x /usr/bin/plutil ]; then
+        value="$(printf '%s' "$INPUT" | /usr/bin/plutil -extract "$1" raw -o - - 2>/dev/null)" && {
+            printf '%s' "$value"
+            return 0
+        }
+        return 1
+    fi
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$INPUT" | jq -r --arg p "$1" \
+            'try getpath($p | split(".") | map(tonumber? // .)) // empty' 2>/dev/null
+        return 0
+    fi
+    return 1
+}
+
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s" | LC_ALL=C tr -d '\000-\037'
+}
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# Matches a production marker as a whole word: prod, production, prd.
+is_prod_text() {
+    printf '%s' "$1" | grep -Eiq '(^|[^[:alnum:]])(prod|production|prd)([^[:alnum:]]|$)'
+}
+
+# once <kind> — true the first time it's asked for this session and kind, so a reminder is shown
+# once rather than on every tool call. False when the event names no session.
+once() {
+    local session dir marker
+    session="$(json_get session_id)"
+    [ -n "$session" ] || session="$(json_get conversation_id)"
+    case "$session" in "" | *[!A-Za-z0-9_.-]*) return 1 ;; esac
+    dir="$(state_dir)" || return 1
+    marker="$dir/$session.$1"
+    [ -e "$marker" ] && return 1
+    : >"$marker" 2>/dev/null
+}
+
+state_dir() {
+    local dir="${CLAUDE_PLUGIN_DATA:-${TMPDIR:-/tmp}/tablestudio-plugin}/sessions"
+    mkdir -p "$dir" 2>/dev/null && printf '%s' "$dir"
+}
+
+# ---------------------------------------------------------------------------------------------
+# The TableStudio app
+# ---------------------------------------------------------------------------------------------
+
+# ts_pref <key> — one of TableStudio's own settings. The app isn't sandboxed, so they live in its
+# ordinary preferences. TABLESTUDIO_PREFS points at a plist file instead (for tests).
+ts_pref() {
+    local value
+    if [ -n "${TABLESTUDIO_PREFS:-}" ]; then
+        [ -x /usr/bin/plutil ] || return 1
+        value="$(/usr/bin/plutil -extract "$1" raw -o - "$TABLESTUDIO_PREFS" 2>/dev/null)" || return 1
+    else
+        command -v defaults >/dev/null 2>&1 || return 1
+        value="$(defaults read "$APP_BUNDLE_ID" "$1" 2>/dev/null)" || return 1
+    fi
+    case "$value" in true) value=1 ;; false) value=0 ;; esac
+    printf '%s' "$value"
+}
+
+# The MCP access token TableStudio generated (Settings → MCP). Only printed into a header.
+ts_token() {
+    local token
+    token="$(ts_pref mcpAuthToken)" || return 1
+    case "$token" in "" | *[!A-Za-z0-9._~+/=-]*) return 1 ;; esac
+    printf '%s' "$token"
+}
+
+# True when the user has turned on TableStudio's MCP server: the app is set up for agents.
+ts_enabled() { [ "$(ts_pref mcpServerEnabled)" = 1 ]; }
+
+# The port the agent's MCP connection uses: the plugin's setting in Claude Code, a fixed 7432 in
+# Codex's MCP entry, and the app's own everywhere else.
+plugin_port() {
+    local port="${CLAUDE_PLUGIN_OPTION_PORT:-${TABLESTUDIO_MCP_PORT:-}}"
+    # Only Claude Code has a plugin setting for it; every other client (and the stdio bridge)
+    # follows the port the app itself serves on.
+    [ -n "$port" ] || [ "$CLIENT" = claude ] || [ "$CLIENT" = codex ] || port="$(ts_pref mcpServerPort)"
+    case "$port" in '' | *[!0-9]*) port=$DEFAULT_PORT ;; esac
+    printf '%s' "$port"
+}
+
+# probe_server <port> — running, unauthorized (it refused TableStudio's own token) or down. The
+# token goes to curl on stdin, not the command line, so it never shows up in `ps`.
+probe_server() {
+    local token code
+    token="$(ts_token)"
+    code="$({ [ -n "$token" ] && printf 'header = "Authorization: Bearer %s"\n' "$token"; } |
+        curl -s -o /dev/null -w '%{http_code}' --max-time 1 -K - "http://127.0.0.1:${1}/" 2>/dev/null)"
+    case "$code" in
+        "" | 000) echo down ;;
+        401 | 403) if [ -n "$token" ]; then echo unauthorized; else echo running; fi ;;
+        *) echo running ;;
+    esac
+}
+
+app_installed() {
+    if [ -n "${TABLESTUDIO_APP_PATH:-}" ]; then [ -d "$TABLESTUDIO_APP_PATH" ]; return; fi
+    [ -d /Applications/TableStudio.app ] && return 0
+    [ -d "$HOME/Applications/TableStudio.app" ] && return 0
+    command -v mdfind >/dev/null 2>&1 &&
+        [ -n "$(mdfind "kMDItemCFBundleIdentifier == '$APP_BUNDLE_ID'" 2>/dev/null | head -n 1)" ]
+}
+
+# TABLESTUDIO_OPEN_APP=0 stops the plugin from ever opening the app.
+open_app_allowed() {
+    case "$(lower "${TABLESTUDIO_OPEN_APP:-1}")" in 0 | false | no | off) return 1 ;; esac
+    command -v open >/dev/null 2>&1
+}
+
+# launch_app <port> — opens TableStudio hidden, in the background, and waits up to 7 seconds for its
+# MCP server to answer.
+launch_app() {
+    local i=0
+    open -g -j -b "$APP_BUNDLE_ID" >/dev/null 2>&1 || return 1
+    while [ "$i" -lt 14 ]; do
+        [ "$(probe_server "$1")" = down ] || return 0
+        sleep 0.5
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# maybe_open_app <port> <dir> — when TableStudio is closed but set up for agents (its MCP server is
+# on, on this port), open it, so a database task doesn't start without its tools. Only in a repo
+# that has a database: an unrelated session never opens the app.
+maybe_open_app() {
+    local app_port
+    open_app_allowed || return 1
+    ts_enabled || return 1
+    # TableStudio only saves the port once it's changed from the default.
+    app_port="$(ts_pref mcpServerPort)"
+    [ "${app_port:-$DEFAULT_PORT}" = "$1" ] || return 1
+    has_database_signals "$2" || return 1
+    launch_app "$1"
+}
+
+has_database_signals() {
+    [ -n "$(describe_database_settings "$1")$(describe_d1_databases "$1")$(describe_migration_tooling "$1")$(describe_compose_databases "$1")" ]
+}
+
+# TableStudio's saved connections (what list_connections returns), one tab-separated line each:
+# id, name, engine, host, port, database, environment, project, read_only, file, d1_id. Empty
+# fields are "-". Never usernames or passwords. Read from the app's own saved list, whose keys stay
+# stable because they're what older versions decode. Sandboxes are left out.
+SAVED_CONNECTIONS_JS='function run(argv) {
+  var src = argv.length ? argv[0] : "";
+  function blob(key) {
+    var value;
+    if (src) {
+      var dict = $.NSDictionary.dictionaryWithContentsOfFile(src);
+      if (!dict || dict.isNil()) return null;
+      value = dict.objectForKey(key);
+    } else {
+      value = $.NSUserDefaults.alloc.initWithSuiteName("sh.tablestudio").dataForKey(key);
+    }
+    if (!value || value.isNil()) return null;
+    var text = $.NSString.alloc.initWithDataEncoding(value, $.NSUTF8StringEncoding);
+    if (!text || text.isNil()) return null;
+    try { return JSON.parse(text.js); } catch (e) { return null; }
+  }
+  var connections = blob("postgres_connections");
+  if (!Array.isArray(connections)) return "#unavailable";
+  var projects = {};
+  (blob("postgres_projects") || []).forEach(function (p) { if (p && p.id) projects[p.id] = p.name; });
+  function field(v) {
+    v = (v === undefined || v === null) ? "" : String(v).replace(/[\t\r\n]+/g, " ").trim();
+    return v === "" ? "-" : v;
+  }
+  return connections.filter(function (c) { return c && c.id && !c.isSandbox; }).map(function (c) {
+    return [c.id, c.name, c.kind, c.host, c.port, c.database, c.environment,
+            projects[c.projectID] || c.projectName, c.readOnly ? "yes" : "no", c.filePath,
+            c.d1DatabaseID].map(field).join("\t");
+  }).join("\n");
+}'
+
+SAVED=""
+SAVED_OK=0
+
+# Loads SAVED; SAVED_OK=1 when TableStudio's list could be read (even if it's empty).
+load_saved_connections() {
+    local out
+    command -v osascript >/dev/null 2>&1 || return 0
+    if [ -n "${TABLESTUDIO_PREFS:-}" ]; then
+        out="$(osascript -l JavaScript -e "$SAVED_CONNECTIONS_JS" "$TABLESTUDIO_PREFS" 2>/dev/null)" || return 0
+    else
+        out="$(osascript -l JavaScript -e "$SAVED_CONNECTIONS_JS" 2>/dev/null)" || return 0
+    fi
+    [ "$out" = "#unavailable" ] && return 0
+    SAVED="$out"
+    SAVED_OK=1
+}
+
+# engine_of <url scheme> — TableStudio's engine name for a connection URL's scheme, or nothing.
+engine_of() {
+    case "$(lower "${1%%+*}")" in
+        postgres | postgresql | pgsql | postgis | timescale | timescaledb | cockroach | cockroachdb) echo postgres ;;
+        mysql | mysql2 | mysqlx | mariadb) echo mysql ;;
+        clickhouse) echo clickhouse ;;
+    esac
+}
+
+default_port() {
+    case "$1" in postgres) echo 5432 ;; mysql) echo 3306 ;; esac
+}
+
+norm_host() {
+    local h
+    h="$(lower "$1")"
+    case "$h" in "" | localhost | *.localhost | 127.* | ::1 | 0.0.0.0) echo localhost ;; *) echo "$h" ;; esac
+}
+
+# saved_matches <engine> <host> <port> <database> — the saved connections pointing at that database,
+# as "name<TAB>id<TAB>environment<TAB>read_only" lines.
+saved_matches() {
+    local engine="$1" host port="$3" db="$4" id name kind shost sport sdb env project ro file d1
+    host="$(norm_host "$2")"
+    [ -n "$port" ] || port="$(default_port "$engine")"
+    while IFS="$TAB" read -r id name kind shost sport sdb env project ro file d1; do
+        [ -n "$id" ] && [ "$kind" = "$engine" ] || continue
+        [ "$shost" = "-" ] && shost=""
+        [ "$(norm_host "$shost")" = "$host" ] || continue
+        [ "$sport" = "-" ] && sport="$(default_port "$engine")"
+        [ -z "$port" ] || [ -z "$sport" ] || [ "$sport" = "$port" ] || continue
+        [ "$sdb" = "-" ] || [ -z "$db" ] || [ "$sdb" = "$db" ] || continue
+        printf '%s\t%s\t%s\t%s\n' "$name" "$id" "$env" "$ro"
+    done <<EOF
+$SAVED
+EOF
+}
+
+# saved_where <column> <value> <engine> — saved connections of that engine whose column (10: file
+# name, 11: D1 database id) is the value, in the same shape as saved_matches.
+saved_where() {
+    local column="$1" want="$2" engine="$3" id name kind shost sport sdb env project ro file d1 have
+    while IFS="$TAB" read -r id name kind shost sport sdb env project ro file d1; do
+        [ -n "$id" ] && [ "$kind" = "$engine" ] || continue
+        if [ "$column" = 10 ]; then have="${file##*/}"; else have="$d1"; fi
+        [ "$have" = "$want" ] || continue
+        printf '%s\t%s\t%s\t%s\n' "$name" "$id" "$env" "$ro"
+    done <<EOF
+$SAVED
+EOF
+}
+
+# connection_suffix <matches> — " → TableStudio connection …" naming the saved connection(s) for a
+# setting, " → not saved in TableStudio", or nothing when TableStudio's list couldn't be read.
+connection_suffix() {
+    local matches="$1" name id env ro label="" count=0
+    [ "$SAVED_OK" = 1 ] || return 0
+    if [ -z "$matches" ]; then
+        printf ' → not saved in TableStudio'
+        return 0
+    fi
+    while IFS="$TAB" read -r name id env ro; do
+        [ -n "$id" ] || continue
+        count=$((count + 1))
+        [ "$count" -le 3 ] || continue
+        [ -z "$label" ] || label="$label, or "
+        label="$label\"$name\" (id $id"
+        [ "$env" = "-" ] || label="$label, $env"
+        [ "$ro" = yes ] && label="$label, read-only"
+        label="$label)"
+    done <<EOF
+$matches
+EOF
+    if [ "$count" -gt 1 ]; then
+        printf ' → TableStudio connections %s' "$label"
+    else
+        printf ' → TableStudio connection %s' "$label"
+    fi
+}
+
+# ---------------------------------------------------------------------------------------------
+# Database targets
+# ---------------------------------------------------------------------------------------------
+
+# url_host <url> — the host part of a connection URL ("" for a socket or file).
+url_host() {
+    local rest="${1#*://}" authority host
+    authority="${rest%%[/?#]*}"
+    authority="${authority##*@}"
+    case "$authority" in
+        \[*) host="${authority%%]*}"; host="${host#[}" ;;
+        *)   host="${authority%%:*}" ;;
+    esac
+    # postgres://user@/db?host=/var/run/postgresql — a unix socket.
+    if [ -z "$host" ]; then
+        case "$rest" in *host=/*) host="" ;; esac
+    fi
+    printf '%s' "$host"
+}
+
+url_port() {
+    local rest="${1#*://}" authority
+    authority="${rest%%[/?#]*}"
+    authority="${authority##*@}"
+    authority="${authority##*]}"
+    case "$authority" in *:*) printf '%s' "${authority##*:}" ;; esac
+}
+
+url_database() {
+    local rest="${1#*://}" path
+    case "$rest" in */*) path="${rest#*/}" ;; *) return ;; esac
+    path="${path%%[?#]*}"
+    printf '%s' "${path%%/*}"
+}
+
+url_scheme() { lower "${1%%://*}"; }
+
+# host_is_local <host> — localhost, loopback, docker-internal, a socket path, or a
+# docker-compose service name (a single label with no dots, like "db" or "postgres").
+host_is_local() {
+    local h
+    h="$(lower "$1")"
+    case "$h" in
+        "" | localhost | *.localhost | 127.* | ::1 | 0.0.0.0 | host.docker.internal | *.local | /*) return 0 ;;
+        *.*) return 1 ;;
+        *:*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# url_is_local <url>
+url_is_local() {
+    case "$(url_scheme "$1")" in
+        file | sqlite | sqlite3) return 0 ;;
+    esac
+    host_is_local "$(url_host "$1")"
+}
+
+# env_lookup <NAME> <preferred env file> <dir>… — a variable's value from an inline assignment in
+# the command, the hook's own environment, then each directory's .env files (in the order frameworks
+# load them). Echoes "value<TAB>source".
+env_lookup() {
+    local name="$1" preferred="$2" value file line dir
+    shift 2
+    value="$(printf '%s' "$GUARD_CMD" | grep -Eo "(^|[[:space:]])${name}=[^[:space:]]+" | head -n 1 | sed -E "s/^[[:space:]]*${name}=//")"
+    value="$(clean_env_value "$value")"
+    if [ -n "$value" ]; then
+        printf '%s\t%s' "$value" "the command"
+        return 0
+    fi
+    value="$(printenv "$name" 2>/dev/null)"
+    if [ -n "$value" ]; then
+        printf '%s\t%s' "$value" "environment"
+        return 0
+    fi
+    for dir in "$@"; do
+        [ -d "$dir" ] || continue
+        for file in $preferred .env.local .env; do
+            [ -f "$dir/$file" ] || continue
+            line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${name}[[:space:]]*=" "$dir/$file" 2>/dev/null | tail -n 1)"
+            [ -n "$line" ] || continue
+            value="$(clean_env_value "${line#*=}")"
+            [ -n "$value" ] && { printf '%s\t%s' "$value" "$file"; return 0; }
+        done
+    done
+    return 1
+}
+
+# clean_env_value <raw> — strip quotes, trailing comments and whitespace from a .env value.
+clean_env_value() {
+    local v="$1"
+    v="${v#"${v%%[![:space:]]*}"}"
+    case "$v" in
+        \"*) v="${v#\"}"; v="${v%%\"*}" ;;
+        \'*) v="${v#\'}"; v="${v%%\'*}" ;;
+        *)   v="${v%%[[:space:]]#*}"; v="${v%"${v##*[![:space:]]}"}" ;;
+    esac
+    printf '%s' "$v"
+}
+
+# ---------------------------------------------------------------------------------------------
+# session-start
+# ---------------------------------------------------------------------------------------------
+
+session_start() {
+    local dir source
+    source="$(json_get source)"
+    [ "$source" = "resume" ] && return 0
+
+    dir="${CLAUDE_PROJECT_DIR:-}"
+    [ -n "$dir" ] || dir="$(json_get cwd)"
+    [ -n "$dir" ] || dir="$(json_get workspace_roots.0)"
+    [ -n "$dir" ] || dir="$PWD"
+    [ -d "$dir" ] || return 0
+
+    # Old reminder markers (one empty file per session) are only needed while their session runs.
+    find "$(state_dir)" -type f -mtime +7 -delete 2>/dev/null
+
+    load_saved_connections
+
+    local settings tooling compose project
+    settings="$(describe_database_settings "$dir"; describe_d1_databases "$dir")"
+    tooling="$(describe_migration_tooling "$dir")"
+    compose="$(describe_compose_databases "$dir")"
+    project="$(describe_project_connections "$dir" "$settings")"
+
+    # Nothing database-shaped here: stay silent rather than add noise to every session.
+    [ -n "$settings$tooling$compose$project" ] || return 0
+
+    local port note
+    port="$(plugin_port)"
+    server_status "$port"
+
+    note="## Database context (from the TableStudio plugin)
+TableStudio is the user's database app. Do this project's database work through its MCP tools rather than psql, mysql, sqlite3 or a one-off script: they reach the user's saved connections without credentials, dry-run writes against the real rows (preflight_statement), try changes on throwaway copies (create_sandbox), and send risky changes to the user's review inbox (stage_migration). For any task that reads or changes a database, follow the TableStudio database-workflow skill.
+
+$(status_text "$port" "$dir")"
+
+    if [ -n "$settings" ]; then
+        note="${note}
+
+This repo's database settings (credentials omitted):
+${settings}"
+        if [ "$SAVED_OK" = 1 ]; then
+            note="${note}
+Pass the id shown as connection_id; there's no need to match list_connections yourself. TableStudio's tools can't reach a setting marked \"not saved in TableStudio\": if the task needs it, ask the user to add it in TableStudio, and never ask for its password in chat."
+        else
+            note="${note}
+To pick the connection_id, match these to list_connections: by project first, then by host, port and database."
+        fi
+        note="${note}
+Never write directly to anything marked production (here or in list_connections' environment): stage the change with stage_migration for the user to review."
+    fi
+    if [ -n "$project" ]; then
+        note="${note}
+
+${project}"
+    fi
+    if [ -n "$compose" ]; then
+        note="${note}
+
+Local databases defined in docker compose:
+${compose}"
+    fi
+    if [ -n "$tooling" ]; then
+        note="${note}
+
+This repo manages its schema with:
+${tooling}
+Make schema changes as migrations with that tool, so the repo stays the source of truth. Don't run ALTER/CREATE/DROP against a shared database by hand. Before calling a migration done, check it against the real data of the database it will deploy to (the database-workflow skill's \"Check a migration against real data\")."
+    fi
+
+    emit_context "$note"
+}
+
+# server_status <port> — sets SERVER_STATE (running, unauthorized, off, port, closed or missing),
+# APP_PORT, and LAUNCHED=1 when this opened the app.
+server_status() {
+    local port="$1" enabled
+    LAUNCHED=0
+    APP_PORT="$(ts_pref mcpServerPort)"
+    SERVER_STATE="$(probe_server "$port")"
+    [ "$SERVER_STATE" = down ] || return 0
+    enabled="$(ts_pref mcpServerEnabled)"
+    if [ -z "$enabled$APP_PORT" ] && ! app_installed; then
+        SERVER_STATE=missing
+        return 0
+    fi
+    # TableStudio only saves the port once it's changed from the default.
+    APP_PORT="${APP_PORT:-$DEFAULT_PORT}"
+    if [ "$enabled" != 1 ]; then
+        SERVER_STATE=off
+    elif [ "$APP_PORT" != "$port" ]; then
+        SERVER_STATE=port
+    elif open_app_allowed && launch_app "$port"; then
+        SERVER_STATE="$(probe_server "$port")"
+        LAUNCHED=1
+    else
+        SERVER_STATE=closed
+    fi
+}
+
+# status_text <port> <dir> — whether the agent has TableStudio's tools, and the fix when it doesn't.
+status_text() {
+    local port="$1" dir="$2" text reconnect="" fix_port
+    case "$CLIENT" in
+        claude) reconnect=" Then they run /mcp and reconnect plugin:tablestudio:tablestudio." ;;
+        codex) reconnect=" Then they start a new Codex session, which connects to it." ;;
+        opencode) reconnect=" Then they restart OpenCode (or run opencode reload)." ;;
+    esac
+    case "$SERVER_STATE" in
+        running)
+            text="TableStudio is running (MCP on localhost:${port})."
+            [ "$LAUNCHED" = 1 ] && text="$text It was closed, so the plugin opened it in the background."
+            if [ "$CLIENT" = claude ]; then
+                text="$text Its tools are named mcp__plugin_tablestudio_tablestudio__<tool> (mcp__plugin_tablestudio_tablestudio__list_connections, …); if they're deferred, load them by name."
+                [ "$LAUNCHED" = 1 ] && text="$text If they're missing, ask the user to run /mcp and reconnect plugin:tablestudio:tablestudio."
+            elif [ "$CLIENT" = codex ] && [ "$LAUNCHED" = 1 ]; then
+                text="$text If its tools are missing, ask the user to start a new Codex session."
+            fi ;;
+        unauthorized)
+            text="Something on localhost:${port} refused TableStudio's MCP token: another app may hold that port, or a second copy of TableStudio is running. If the task needs the database, ask the user to check TableStudio → Settings → MCP." ;;
+        off)
+            text="TableStudio's MCP server is turned off, so its tools aren't available. If the task needs the database, ask the user to turn it on in TableStudio → Settings → MCP (it needs TableStudio Pro).${reconnect}" ;;
+        port)
+            if [ "$CLIENT" = codex ]; then
+                # Codex plugins have no settings, so the plugin's port is fixed.
+                fix_port="set TableStudio's MCP port back to ${port} (Settings → MCP)"
+            else
+                fix_port="set the plugin's port to ${APP_PORT} (/plugin → tablestudio → Configure) or TableStudio's back to ${port}"
+            fi
+            text="TableStudio serves MCP on port ${APP_PORT}, but the plugin connects to ${port}, so its tools aren't available. If the task needs the database, ask the user to ${fix_port}.${reconnect}" ;;
+        closed)
+            text="TableStudio's MCP server isn't answering on localhost:${port}: the app is closed, or MCP needs TableStudio Pro. If the task needs the database, ask the user to open TableStudio.${reconnect}" ;;
+        *)
+            text="TableStudio isn't installed. It's the Mac database app this plugin works through (https://tablestudio.sh). Without it, use the repo's own tooling, and never write to a remote or production database from the shell." ;;
+    esac
+
+    if [ "$CLIENT" = cursor ] && cursor_has_server "$port" "$dir"; then
+        text="$text TableStudio is also registered by hand in Cursor's mcp.json, so its tools may appear twice. Suggest the user remove that tablestudio entry (Cursor Settings → MCP): the plugin connects on its own, without a token in the file."
+    fi
+    if [ "$CLIENT" = claude ] && claude_has_manual_server "$port" "$dir"; then
+        text="$text TableStudio is also registered by hand (claude mcp add), so its tools appear twice. Suggest the user run: claude mcp remove tablestudio"
+    fi
+    if [ "$CLIENT" = codex ] && codex_has_manual_server "$port"; then
+        text="$text TableStudio is also registered by hand in ~/.codex/config.toml, so its tools appear twice. Suggest the user delete that [mcp_servers.…] entry (the one pointing at localhost:${port}); the plugin connects on its own."
+    fi
+    printf '%s' "$text"
+}
+
+# codex_has_manual_server <port> — an [mcp_servers.*] entry in Codex's own config for the same
+# server, such as the snippet from TableStudio's Settings → MCP.
+codex_has_manual_server() {
+    grep -Eq "^[[:space:]]*url[[:space:]]*=[[:space:]]*\"http://(localhost|127\.0\.0\.1):${1}/?\"" \
+        "${CODEX_HOME:-$HOME/.codex}/config.toml" 2>/dev/null
+}
+
+# cursor_has_server <port> <dir> — Cursor's MCP config (global or this project's) points at it.
+cursor_has_server() {
+    local file
+    for file in "$HOME/.cursor/mcp.json" "$2/.cursor/mcp.json"; do
+        [ -f "$file" ] || continue
+        grep -Eq "(localhost|127\.0\.0\.1):${1}([/\"]|$)" "$file" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+# claude_has_manual_server <port> <dir> — a `claude mcp add` entry for the same server, besides
+# the one this plugin registers.
+claude_has_manual_server() {
+    local file
+    for file in "$HOME/.claude.json" "$2/.mcp.json"; do
+        [ -f "$file" ] || continue
+        grep -Eq "\"url\"[[:space:]]*:[[:space:]]*\"http://(localhost|127\.0\.0\.1):${1}/?\"" "$file" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+# describe_project_connections <dir> <settings text> — saved connections in a TableStudio project
+# named like this folder, besides the ones the settings already named.
+describe_project_connections() {
+    local dir="$1" listed="$2" want id name kind shost sport sdb env project ro file d1 count=0 where
+    [ "$SAVED_OK" = 1 ] || return 0
+    want="$(squash "$(basename "$dir")")"
+    [ -n "$want" ] || return 0
+    while IFS="$TAB" read -r id name kind shost sport sdb env project ro file d1; do
+        [ -n "$id" ] && [ "$project" != "-" ] || continue
+        [ "$(squash "$project")" = "$want" ] || continue
+        case "$listed" in *"$id"*) continue ;; esac
+        [ "$count" -lt 6 ] || break
+        [ "$count" -eq 0 ] && printf 'More connections in the TableStudio project "%s" (named like this folder):\n' "$project"
+        where="$kind"
+        [ "$shost" = "-" ] || where="$where, $shost"
+        [ "$sdb" = "-" ] || where="$where/$sdb"
+        [ "$env" = "-" ] || where="$where, $env"
+        [ "$ro" = yes ] && where="$where, read-only"
+        printf -- '- "%s" (id %s, %s)\n' "$name" "$id" "$where"
+        count=$((count + 1))
+    done <<EOF
+$SAVED
+EOF
+}
+
+squash() { lower "$1" | tr -cd '[:alnum:]'; }
+
+# One line per Cloudflare D1 database bound in the repo's wrangler config.
+describe_d1_databases() {
+    local dir="$1" file names ids name id
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue
+        grep -q 'd1_databases' "$dir/$file" 2>/dev/null || continue
+        names="$(grep -Eo '"?database_name"?[[:space:]]*[:=][[:space:]]*"[^"]+"' "$dir/$file" | sed -E 's/.*"([^"]+)"$/\1/')"
+        ids="$(grep -Eo '"?database_id"?[[:space:]]*[:=][[:space:]]*"[^"]+"' "$dir/$file" | sed -E 's/.*"([^"]+)"$/\1/')"
+        while IFS='|' read -r name id; do
+            [ -n "$id" ] || continue
+            printf -- '- D1 database "%s" (%s) — remote, Cloudflare%s\n' "${name:-$id}" "$file" \
+                "$(connection_suffix "$(saved_where 11 "$id" d1)")"
+        done <<EOF
+$(paste -d '|' <(printf '%s\n' "$names") <(printf '%s\n' "$ids"))
+EOF
+    done <<EOF
+$(cd "$dir" 2>/dev/null && find . -maxdepth 3 \( -name node_modules -o -name .git \) -prune -o -type f \( -name wrangler.toml -o -name wrangler.json -o -name wrangler.jsonc \) -print 2>/dev/null | sed 's|^\./||' | sort | head -n 5)
+EOF
+}
+
+# One line per database setting found in the project's .env files.
+describe_database_settings() {
+    local dir="$1" file rel line name value desc count=0
+    local files
+    files="$(cd "$dir" 2>/dev/null && find . -maxdepth 3 \( -name node_modules -o -name .git -o -name vendor -o -name .venv -o -name venv \) -prune -o -type f -name '.env*' -print 2>/dev/null | sort | head -n 30)"
+    [ -n "$files" ] || return 0
+
+    while IFS= read -r rel; do
+        rel="${rel#./}"
+        case "$rel" in *.example | *.sample | *.template | *.dist | *.defaults | *.schema) continue ;; esac
+        file="$dir/$rel"
+        while IFS= read -r line; do
+            [ "$count" -ge 12 ] && return 0
+            name="$(printf '%s' "${line%%=*}" | sed -E 's/^[[:space:]]*(export[[:space:]]+)?//; s/[[:space:]]+$//')"
+            value="$(clean_env_value "${line#*=}")"
+            desc="$(describe_setting "$name" "$value" "$rel")"
+            [ -n "$desc" ] || continue
+            printf -- '- %s (%s): %s\n' "$name" "$rel" "$desc"
+            count=$((count + 1))
+        done <<EOF
+$(grep -E -e '^[[:space:]]*(export[[:space:]]+)?[A-Za-z0-9_]*(DATABASE|DB|DIRECT|POSTGRES|PG|MYSQL|MARIADB|SQLITE|TURSO|LIBSQL|CLICKHOUSE|SUPABASE|NEON)[A-Za-z0-9_]*(URL|URI|DSN|HOST)[[:space:]]*=' \
+           -e '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=[[:space:]]*["'"'"']?(postgres|postgresql|mysql|mariadb|libsql|clickhouse|cockroachdb)(\+[a-z0-9]+)?://' "$file" 2>/dev/null)
+EOF
+    done <<EOF
+$files
+EOF
+}
+
+# describe_setting <NAME> <value> <file> — engine, host, port, database, local/remote, production.
+# Never includes usernames, passwords or query parameters.
+describe_setting() {
+    local name="$1" value="$2" file="$3" scheme host port db where engine prod=""
+    [ -n "$value" ] || return 0
+    if is_prod_text "$name" || is_prod_text "$file"; then prod=", production"; fi
+
+    case "$value" in
+        \$\{*\} | \$[A-Za-z_]*)
+            local ref="${value#\$}"; ref="${ref#\{}"; ref="${ref%\}}"
+            printf 'refers to %s%s' "$ref" "$prod"
+            return 0 ;;
+    esac
+
+    case "$value" in
+        *://*)
+            scheme="$(url_scheme "$value")"
+            case "$scheme" in
+                http | https) return 0 ;;   # an API URL (Supabase, Neon console…), not a database
+            esac
+            case "$scheme" in
+                file | sqlite | sqlite3)
+                    describe_sqlite_file "$value" "$prod"; return 0 ;;
+            esac
+            host="$(url_host "$value")"
+            port="$(url_port "$value")"
+            db="$(url_database "$value")"
+            if is_prod_text "$host" || is_prod_text "$db"; then prod=", production"; fi
+            if url_is_local "$value"; then where="local"; else where="remote"; fi
+            printf '%s, %s%s' "$scheme" "${host:-local socket}" "${port:+:$port}"
+            [ -n "$db" ] && printf ', database "%s"' "$db"
+            printf ' — %s%s' "$where" "$prod"
+            engine="$(engine_of "$scheme")"
+            [ -n "$engine" ] && connection_suffix "$(saved_matches "$engine" "$host" "$port" "$db")"
+            return 0 ;;
+        file:* | *.db | *.sqlite | *.sqlite3)
+            describe_sqlite_file "$value" "$prod"; return 0 ;;
+    esac
+
+    # A bare host setting (DB_HOST=…, PGHOST=…).
+    case "$name" in
+        *HOST)
+            if is_prod_text "$value"; then prod=", production"; fi
+            if host_is_local "$value"; then where="local"; else where="remote"; fi
+            printf 'host %s — %s%s' "$value" "$where" "$prod" ;;
+    esac
+}
+
+# describe_sqlite_file <value> <production marker> — "sqlite file dev.db — local", plus the saved
+# connection with that file name.
+describe_sqlite_file() {
+    local base="${1%%[?#]*}"
+    base="${base##*/}"
+    base="${base#file:}"
+    printf 'sqlite file %s — local%s' "${base:-?}" "$2"
+    [ -n "$base" ] && connection_suffix "$(saved_where 10 "$base" sqlite)"
+}
+
+describe_migration_tooling() {
+    local dir="$1" found
+    has() { [ -e "$dir/$1" ]; }
+    first() { (cd "$dir" 2>/dev/null && find . -maxdepth 3 \( -name node_modules -o -name .git -o -name vendor -o -name .venv \) -prune -o "$@" -print 2>/dev/null | head -n 1 | sed 's|^\./||'); }
+
+    found="$(first -type f -name 'schema.prisma')"
+    [ -n "$found" ] || found="$(first -type d -path '*prisma/schema')"
+    if [ -n "$found" ]; then
+        printf -- '- Prisma (%s). New migration: npx prisma migrate dev --name <change>\n' "$found"
+    fi
+    found="$(first -type f \( -name 'drizzle.config.ts' -o -name 'drizzle.config.js' -o -name 'drizzle.config.mjs' -o -name 'drizzle.config.cjs' -o -name 'drizzle.config.json' \))"
+    [ -n "$found" ] && printf -- '- Drizzle Kit (%s). New migration: npx drizzle-kit generate\n' "$found"
+    if has db/migrate && has Gemfile; then
+        printf -- '- Rails (db/migrate). New migration: bin/rails generate migration <Name>\n'
+    fi
+    if has manage.py && [ -n "$(first -type f -path '*/migrations/__init__.py')" ]; then
+        printf -- '- Django migrations. New migration: python manage.py makemigrations\n'
+    fi
+    has alembic.ini && printf -- '- Alembic (alembic.ini). New migration: alembic revision --autogenerate -m "<change>"\n'
+    if has artisan && has database/migrations; then
+        printf -- '- Laravel (database/migrations). New migration: php artisan make:migration <name>\n'
+    fi
+    has supabase/migrations && printf -- '- Supabase CLI (supabase/migrations). New migration: supabase migration new <name>\n'
+    found="$(first -type f \( -name 'knexfile.js' -o -name 'knexfile.ts' -o -name 'knexfile.cjs' -o -name 'knexfile.mjs' \))"
+    [ -n "$found" ] && printf -- '- Knex (%s). New migration: npx knex migrate:make <name>\n' "$found"
+    has .sequelizerc && printf -- '- Sequelize (.sequelizerc). New migration: npx sequelize-cli migration:generate --name <name>\n'
+    has priv/repo/migrations && printf -- '- Ecto (priv/repo/migrations). New migration: mix ecto.gen.migration <name>\n'
+    if has package.json && grep -q '"typeorm"' "$dir/package.json" 2>/dev/null; then
+        printf -- '- TypeORM. New migration: npx typeorm migration:generate (check package.json scripts first)\n'
+    fi
+    found="$(first -type f \( -name 'wrangler.toml' -o -name 'wrangler.json' -o -name 'wrangler.jsonc' \))"
+    if [ -n "$found" ] && grep -q 'd1_databases' "$dir/$found" 2>/dev/null; then
+        printf -- '- Cloudflare D1 (%s). New migration: npx wrangler d1 migrations create <db> <name>\n' "$found"
+    fi
+    local sqldir
+    for sqldir in db/migrations migrations sql/migrations database/migrations; do
+        [ -d "$dir/$sqldir" ] || continue
+        [ "$sqldir" = "database/migrations" ] && has artisan && continue
+        if ls "$dir/$sqldir"/*.sql >/dev/null 2>&1; then
+            printf -- '- Plain SQL migration files in %s/ (goose, dbmate, golang-migrate or similar). Add a new numbered file there.\n' "$sqldir"
+            break
+        fi
+    done
+}
+
+describe_compose_databases() {
+    local dir="$1" file image
+    for file in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+        [ -f "$dir/$file" ] || continue
+        grep -Eio 'image:[[:space:]]*["'"'"']?[a-z0-9./_-]*(postgres|postgis|mysql|mariadb|clickhouse)[a-z0-9./_:-]*' "$dir/$file" 2>/dev/null |
+            sed -E 's/^image:[[:space:]]*["'"'"']?//' | sort -u | head -n 5 |
+            while IFS= read -r image; do printf -- '- %s (%s)\n' "$image" "$file"; done
+    done
+}
+
+# ---------------------------------------------------------------------------------------------
+# guard-shell
+# ---------------------------------------------------------------------------------------------
+
+# Programs that talk to a database. A command that mentions none of them passes straight through.
+DB_COMMAND_RE='(^|[^[:alnum:]_.-])(psql|pg_restore|mysql|mariadb|clickhouse-client|clickhouse|prisma|drizzle-kit|supabase|rails|rake|manage\.py|alembic|artisan|knex|sequelize|sequelize-cli|wrangler|turso|flyway|goose|dbmate|migrate|sqlx|atlas)([^[:alnum:]_-]|$)'
+
+# Package scripts that migrate or seed: `npm run migrate:prod`, `pnpm db:push`, `bun run seed`.
+PKG_SCRIPT_RE='(^|[^[:alnum:]_.-])(npm|pnpm|yarn|bun)[[:space:]]+(run[[:space:]]+)?[A-Za-z0-9:_.-]*(migrat|db:push|db:deploy|db:reset|seed)[A-Za-z0-9:_.-]*'
+
+# Commands that change a database even with no SQL in sight.
+MIGRATE_RE='prisma[[:space:]]+(migrate[[:space:]]+(deploy|reset|resolve|dev)|db[[:space:]]+(push|execute|seed))|drizzle-kit[[:space:]]+(push|migrate|drop)|supabase[[:space:]]+(db[[:space:]]+(push|reset)|migration[[:space:]]+(up|repair))|(rails|rake)[[:space:]]+db:[a-z:_]*(migrate|rollback|drop|reset|setup|seed|load|purge|truncate|prepare)|manage\.py[[:space:]]+(migrate|flush|loaddata)|alembic[[:space:]].*(upgrade|downgrade|stamp)|artisan[[:space:]]+(migrate|db:(wipe|seed))|knex[[:space:]]+(migrate|seed):|sequelize(-cli)?[[:space:]]+db:(migrate|seed|drop|create)|wrangler[[:space:]]+d1[[:space:]]+migrations[[:space:]]+apply|flyway[[:space:]].*(migrate|clean|repair|baseline|undo)|goose[[:space:]].*[[:space:]](up|up-by-one|up-to|down|down-to|reset|redo)([[:space:]]|$)|dbmate[[:space:]].*(up|down|migrate|rollback|drop|create)([[:space:]]|$)|(^|[;&|[:space:]])migrate[[:space:]].*[[:space:]](up|down|drop|force|goto)([[:space:]]|$)|sqlx[[:space:]]+(migrate[[:space:]]+(run|revert)|database[[:space:]]+(drop|reset|setup|create))|atlas[[:space:]]+(schema[[:space:]]+(apply|clean)|migrate[[:space:]]+apply)|pg_restore'
+
+# Commands whose default target is a deployed database rather than a local one.
+DEPLOY_RE='prisma[[:space:]]+migrate[[:space:]]+(deploy|resolve)|supabase[[:space:]]+db[[:space:]]+push|wrangler[[:space:]].*--remote|turso[[:space:]]+db[[:space:]]+shell|flyway[[:space:]]'
+
+# SQL that writes. Matched against lower-cased text.
+WRITE_SQL_RE='(^|[^[:alnum:]_])(insert[[:space:]]+into|replace[[:space:]]+into|update[[:space:]]+[^[:space:]]+[[:space:]]+set|delete[[:space:]]+from|merge[[:space:]]+into|upsert|create[[:space:]]+(table|index|unique|view|materialized|schema|database|extension|function|procedure|trigger|type|sequence|role|user|policy|or[[:space:]]+replace)|alter[[:space:]]+[a-z]|drop[[:space:]]+[a-z]|truncate[[:space:]]+(table[[:space:]]+)?[a-z"`]|grant[[:space:]]|revoke[[:space:]]|rename[[:space:]]+table|copy[[:space:]]+[^[:space:]]+.*[[:space:]]from[[:space:]]|load[[:space:]]+data|vacuum|reindex|cluster[[:space:]]|refresh[[:space:]]+materialized|call[[:space:]]+[a-z]|do[[:space:]]+\$)'
+
+# Heredocs fed to these run their body: keep it. Any other heredoc body is data being written.
+KEEP_HEREDOC_RE='(^|[^[:alnum:]_.-])(psql|mysql|mariadb|sqlite3|clickhouse-client|clickhouse|bash|sh|zsh|dash|ksh|ssh)([^[:alnum:]_-]|$)'
+
+# strip_heredocs <cmd> — the command without the text it only writes out: the bodies of heredocs
+# that carry data, and the quoted arguments of echo and printf. `cat > case.sh <<'EOF' … psql -h
+# prod … EOF` and `printf 'npm run migrate' > README.md` write files; they don't run anything.
+# (SQL echoed into a client still counts: a client reading stdin is treated as a write.)
+strip_heredocs() {
+    local cmd="$1"
+    case "$cmd" in
+        *echo* | *printf*)
+            cmd="$(printf '%s' "$cmd" | sed -E "s/(^|[;&|[:space:](])(echo|printf)([[:space:]]+(-[A-Za-z]+|'[^']*'|\"[^\"]*\"))+/\1\2 ''/g")" ;;
+    esac
+    case "$cmd" in *"<<"*) ;; *) printf '%s' "$cmd"; return 0 ;; esac
+    printf '%s\n' "$cmd" | awk -v keep="$KEEP_HEREDOC_RE" -v q="'" '
+        tag != "" { line = $0; sub(/^\t+/, "", line); if (line == tag) tag = ""; next }
+        {
+            print
+            text = $0
+            gsub(/<<</, "", text)   # a here-string is one line, not a heredoc
+            opener = "<<-?[ \t]*[\"" q "]?[A-Za-z_][A-Za-z0-9_]*[\"" q "]?"
+            if (match(text, opener) && text !~ keep) {
+                tag = substr(text, RSTART, RLENGTH)
+                sub(/^<<-?[ \t]*/, "", tag)
+                gsub("[\"" q "]", "", tag)
+            }
+        }'
+}
+
+# strip_text_tools <cmd> — the command without the parts that only read or search text: a segment
+# (split on unquoted ; && || | and newlines) whose program is grep, rg, git, cat, sed, jq and the
+# like can mention `psql` or `INSERT INTO` all it wants without running either. `cat x.sql | psql`
+# keeps its psql, `find … -exec` keeps its segment, and so does anything this can't classify.
+strip_text_tools() {
+    printf '%s\n' "$1" | awk -v q="'" '
+        function flush(   words, n, i, w, prog, drop) {
+            n = split(seg, words, /[ \t]+/)
+            prog = ""
+            for (i = 1; i <= n; i++) {
+                w = words[i]
+                if (w == "" || w ~ /^[A-Za-z_][A-Za-z0-9_]*=/) continue
+                if (w == "sudo" || w == "env" || w == "time" || w == "nohup" || w == "command" || w == "exec" || w == "noglob") continue
+                prog = w; break
+            }
+            sub(/.*\//, "", prog)
+            drop = prog ~ /^(grep|egrep|fgrep|rg|ag|ack|sed|cut|tr|head|tail|less|more|cat|bat|wc|sort|uniq|jq|yq|ls|tree|file|stat|diff|cmp|git|gh|echo|printf|test|true|false|which|type|man|open|code|cursor)$/
+            if (prog == "find" && seg !~ /-(exec|execdir|ok|okdir|delete)([ \t]|$)/) drop = 1
+            if (!drop && seg ~ /[^ \t]/) out = out (out == "" ? "" : " ; ") seg
+            seg = ""
+        }
+        {
+            line = $0
+            for (i = 1; i <= length(line); i++) {
+                c = substr(line, i, 1)
+                if (quote != "") {
+                    seg = seg c
+                    if (c == "\\" && quote == "\"") { i++; seg = seg substr(line, i, 1); continue }
+                    if (c == quote) quote = ""
+                    continue
+                }
+                if (c == q || c == "\"") { quote = c; seg = seg c; continue }
+                if (c == ";" || c == "|" || c == "&") {
+                    flush()
+                    if (substr(line, i + 1, 1) == c) i++
+                    continue
+                }
+                seg = seg c
+            }
+            if (quote != "") seg = seg "\n"; else flush()
+        }
+        END { flush(); print out }'
+}
+
+GUARD_CMD=""
+
+guard_shell() {
+    local cmd dir mode
+    if [ "$CLIENT" = "cursor" ]; then cmd="$(json_get command)"; else cmd="$(json_get tool_input.command)"; fi
+    [ -n "$cmd" ] || return 0
+    cmd="$(strip_text_tools "$(strip_heredocs "$cmd")")"
+    [ -n "$cmd" ] || return 0
+    GUARD_CMD="$cmd"
+
+    mode="$(lower "${TABLESTUDIO_GUARD_MODE:-${CLAUDE_PLUGIN_OPTION_GUARD_MODE:-standard}}")"
+    case "$mode" in off | none | disabled) return 0 ;; ask | standard) ;; *) mode="standard" ;; esac
+
+    printf '%s' "$cmd" | grep -Eq "$DB_COMMAND_RE|$PKG_SCRIPT_RE" || return 0
+
+    dir="$(json_get cwd)"
+    [ -n "$dir" ] || dir="$(json_get workspace_roots.0)"
+    [ -n "$dir" ] || dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+
+    is_write_command "$cmd" "$dir" || return 0
+
+    # `cd apps/api && …` runs against that directory's .env, so look there first.
+    local cd_dir
+    cd_dir="$(printf '%s' "$cmd" | sed -nE 's/^[[:space:]]*cd[[:space:]]+([^[:space:];&|]+).*/\1/p' | head -n 1)"
+    cd_dir="${cd_dir%\"}"; cd_dir="${cd_dir#\"}"; cd_dir="${cd_dir%\'}"; cd_dir="${cd_dir#\'}"
+    case "$cd_dir" in "") ;; /*) ;; "~"*) cd_dir="$HOME${cd_dir#\~}" ;; *) cd_dir="$dir/$cd_dir" ;; esac
+
+    # Where does it point? Collect every target the command names, plus the settings it reads.
+    local evidence="" prod_evidence="" remote=0 resolved=0 unresolved="" target host
+
+    while IFS= read -r target; do
+        [ -n "$target" ] || continue
+        resolved=1
+        host="$(url_host "$target")"
+        if ! url_is_local "$target"; then remote=1; evidence="${evidence:-host ${host}}"; fi
+        if is_prod_text "$host" || is_prod_text "$(url_database "$target")"; then prod_evidence="${prod_evidence:-host ${host}}"; fi
+    done <<EOF
+$(printf '%s' "$cmd" | grep -Eo '[A-Za-z][A-Za-z0-9+.-]*://[^[:space:]"'"'"'`]+' | grep -Eiv '^https?://')
+EOF
+
+    while IFS= read -r host; do
+        [ -n "$host" ] || continue
+        resolved=1
+        if ! host_is_local "$host"; then remote=1; evidence="${evidence:-host ${host}}"; fi
+        is_prod_text "$host" && prod_evidence="${prod_evidence:-host ${host}}"
+    done <<EOF
+$(printf '%s' "$cmd" | grep -Eo '(^|[[:space:]])(-h[[:space:]]*|--host[=[:space:]]+|PGHOST=|MYSQL_HOST=)[^-[:space:]"'"'"';|&$][^[:space:]"'"'"';|&]*' | sed -E 's/^[[:space:]]*(-h[[:space:]]*|--host[=[:space:]]+|PGHOST=|MYSQL_HOST=)//')
+EOF
+
+    # Environment-style markers: RAILS_ENV=production, --env prod, .env.production, $PROD_DATABASE_URL,
+    # and package script names like migrate:prod.
+    local markers
+    markers="$(printf '%s' "$cmd" | grep -Eio '([A-Z_]*ENV|DJANGO_SETTINGS_MODULE|STAGE)=[^[:space:]]+|--(env|environment|stage|profile|env-file|target|settings)[=[:space:]]+[^[:space:]]+|\.env\.[a-z]+|\$\{?[A-Za-z_]*(PROD|PRODUCTION|PRD)[A-Za-z0-9_]*\}?' | tr '\n' ' ')"
+    markers="$markers $(printf '%s' "$cmd" | grep -Eo "$PKG_SCRIPT_RE" | sed -E 's/.*[[:space:]]//' | tr '\n' ' ')"
+    if is_prod_text "$markers"; then
+        prod_evidence="${prod_evidence:-$(printf '%s' "$markers" | tr -s ' ' | sed 's/^ //; s/ $//')}"
+    fi
+
+    # Variables the command expands ($DATABASE_URL), or the one a migration tool reads by default.
+    local envfile vars var found value source explicit=1
+    envfile="$(printf '%s' "$cmd" | grep -Eo '\.env\.[A-Za-z0-9_.-]+' | head -n 1)"
+    vars="$(printf '%s' "$cmd" | grep -Eo '\$\{?[A-Za-z_][A-Za-z0-9_]*(URL|URI|DSN|HOST)\}?' | sed -E 's/[${}]//g' | sort -u)"
+    if [ "$resolved" -eq 0 ] && [ -z "$vars" ]; then
+        vars="$(default_url_variable "$cmd" "${cd_dir:-$dir}")"
+        explicit=0
+    fi
+    for var in $vars; do
+        if ! found="$(env_lookup "$var" "$envfile" "$cd_dir" "$dir")"; then
+            [ "$explicit" -eq 1 ] && unresolved="${unresolved:+$unresolved, }\$$var"
+            continue
+        fi
+        value="${found%%	*}"
+        source="${found#*	}"
+        resolved=1
+        is_prod_text "$var $source" && prod_evidence="${prod_evidence:-$var from $source}"
+        case "$value" in
+            *://*)
+                host="$(url_host "$value")"
+                if ! url_is_local "$value"; then remote=1; evidence="${evidence:-$var from $source → host ${host:-unknown}}"; fi
+                if is_prod_text "$host" || is_prod_text "$(url_database "$value")"; then
+                    prod_evidence="${prod_evidence:-$var from $source → host $host}"
+                fi ;;
+            *)
+                if ! host_is_local "$value"; then remote=1; evidence="${evidence:-$var from $source → $value}"; fi
+                is_prod_text "$value" && prod_evidence="${prod_evidence:-$var from $source → $value}" ;;
+        esac
+    done
+
+    # Deploy-style commands target a deployed database unless something says it's local.
+    if printf '%s' "$cmd" | grep -Eq "$DEPLOY_RE" && ! printf '%s' "$cmd" | grep -Eq -- '--local([[:space:]]|$)'; then
+        if [ "$resolved" -eq 0 ]; then
+            remote=1
+            evidence="${evidence:-a deploy command, which targets a deployed database}"
+        fi
+    fi
+
+    if [ -n "$prod_evidence" ]; then
+        if [ "$mode" = "ask" ]; then
+            decide ask "$(ask_reason "a production database ($prod_evidence)")"
+        elif printf '%s' "$cmd" | grep -Eq "$MIGRATE_RE|$PKG_SCRIPT_RE"; then
+            decide deny "TableStudio blocked this command: it runs migrations or seeds against what looks like a production database ($prod_evidence). Production gets migrations through the project's normal deploy process, not from this session. Apply them to the local development database instead; if the user wants this exact command run, ask them to run it themselves."
+        else
+            decide deny "TableStudio blocked this command: it writes to what looks like a production database ($prod_evidence). Don't change production from the shell. Use TableStudio instead: check the statement with preflight_statement, then propose it with stage_migration so the user reviews and applies it in TableStudio. If the user wants this exact command run, ask them to run it themselves."
+        fi
+        return 0
+    fi
+    if [ "$remote" -eq 1 ]; then
+        decide ask "$(ask_reason "a non-local database ($evidence)")"
+        return 0
+    fi
+    if [ -n "$unresolved" ] && [ "$resolved" -eq 0 ]; then
+        decide ask "$(ask_reason "a database TableStudio couldn't identify ($unresolved isn't set in the environment or the project's .env files)")"
+        return 0
+    fi
+    return 0
+}
+
+ask_reason() {
+    printf 'TableStudio: this command writes to %s. Allow it only if you expect a change there. The safer route is to have the agent check it with preflight_statement and propose it with stage_migration for review in TableStudio.' "$1"
+}
+
+# is_write_command <cmd> <dir> — true when the command changes a database (or might: a client
+# reading SQL we can't see is treated as a write).
+is_write_command() {
+    local cmd="$1" dir="$2" lc
+    lc="$(lower "$cmd")"
+
+    printf '%s' "$cmd" | grep -Eq "$MIGRATE_RE|$PKG_SCRIPT_RE" && return 0
+
+    local file
+
+    # SQL through a platform's CLI: `wrangler d1 execute db --command "…"` or `--file`, and
+    # `turso db shell db "…"`. Read-only SQL passes; an interactive shell counts as a write.
+    if printf '%s' "$cmd" | grep -Eq 'wrangler[[:space:]]+d1[[:space:]]+execute|turso[[:space:]]+db[[:space:]]+shell'; then
+        printf '%s' "$lc" | grep -Eq "$WRITE_SQL_RE" && return 0
+        file="$(sql_file_arg "$cmd")"
+        if [ -n "$file" ]; then sql_file_writes "$file" "$dir"; return; fi
+        printf '%s' "$cmd" | grep -Eq -- '--command[=[:space:]]|turso[[:space:]]+db[[:space:]]+shell[[:space:]]+[^[:space:]]+[[:space:]]+["'"'"']' && return 1
+        return 0
+    fi
+
+    # Raw clients: psql, mysql, mariadb, clickhouse-client.
+    local client
+    client="$(printf '%s' "$lc" | grep -Eo '(^|[^[:alnum:]_.-])(psql|mysql|mariadb|clickhouse-client|clickhouse[[:space:]]+client)([^[:alnum:]_-]|$)' | head -n 1 | tr -cd '[:alpha:]-')"
+    [ -n "$client" ] || return 1
+
+    printf '%s' "$lc" | grep -Eq "$WRITE_SQL_RE" && return 0
+
+    # Version and help output never touch a database. (Case-sensitive: psql's -v sets a variable.)
+    printf '%s' "$cmd" | grep -Eq '(^|[[:space:]])(--version|-V|--help|-\?)([[:space:]]|$)' && return 1
+
+    # SQL from a file: read it when we can, assume the worst when we can't.
+    file="$(sql_file_arg "$cmd")"
+    if [ -n "$file" ]; then
+        sql_file_writes "$file" "$dir"
+        return
+    fi
+
+    # Inline SQL that only reads — the write check above already saw it.
+    case "$client" in
+        psql) printf '%s' "$cmd" | grep -Eq '(^|[[:space:]])(-c|--command)([=[:space:]]|$)|<<' && return 1 ;;
+        mysql | mariadb) printf '%s' "$cmd" | grep -Eq '(^|[[:space:]])(-e|--execute)([=[:space:]]|$)|<<' && return 1 ;;
+        *) printf '%s' "$cmd" | grep -Eq '(^|[[:space:]])(-q|--query)([=[:space:]]|$)|<<' && return 1 ;;
+    esac
+
+    # Listing databases is a read.
+    printf '%s' "$cmd" | grep -Eq '(^|[[:space:]])(-l|--list)([[:space:]]|$)' && return 1
+
+    # SQL piped in from somewhere we can't see, or an interactive session.
+    return 0
+}
+
+# sql_file_arg <cmd> — the SQL file a command reads: `-f file`, `--file=file`, `< file`.
+sql_file_arg() {
+    local file
+    file="$(printf '%s' "$1" | grep -Eo '(^|[[:space:]])(-f[[:space:]]*|--file[=[:space:]]+|<[[:space:]]*)[^[:space:]<>|;&]+' | grep -Ev '<<' | head -n 1 | sed -E 's/^[[:space:]]*(-f[[:space:]]*|--file[=[:space:]]+|<[[:space:]]*)//')"
+    file="${file%\"}"; file="${file#\"}"; file="${file%\'}"; file="${file#\'}"
+    printf '%s' "$file"
+}
+
+# sql_file_writes <file> <dir> — true when the file's SQL writes, or when it can't be read.
+sql_file_writes() {
+    local file="$1" size
+    case "$file" in /*) ;; *) file="$2/$file" ;; esac
+    size="$(wc -c <"$file" 2>/dev/null | tr -d '[:space:]')"
+    if [ -f "$file" ] && [ -n "$size" ] && [ "$size" -le "$MAX_SQL_FILE_BYTES" ]; then
+        tr '[:upper:]' '[:lower:]' <"$file" | grep -Eq "$WRITE_SQL_RE"
+        return
+    fi
+    return 0
+}
+
+# default_url_variable <cmd> <dir> — the variable a migration tool reads when the command names
+# no database: Prisma's `url = env("…")`, otherwise DATABASE_URL.
+default_url_variable() {
+    local cmd="$1" dir="$2" schema name
+    # These pick their target from their own config (a linked project, --remote, a named database),
+    # never from DATABASE_URL — guessing it would mislabel a deployed database as local.
+    printf '%s' "$cmd" | grep -Eq '(supabase|wrangler|turso|flyway)[[:space:]]' && return 0
+    if printf '%s' "$cmd" | grep -Eq 'prisma[[:space:]]'; then
+        while IFS= read -r schema; do
+            [ -n "$schema" ] || continue
+            name="$(grep -Eo 'url[[:space:]]*=[[:space:]]*env\("[A-Za-z_][A-Za-z0-9_]*"\)' "$dir/$schema" 2>/dev/null | head -n 1 | sed -E 's/.*env\("([^"]+)"\).*/\1/')"
+            [ -n "$name" ] && { printf '%s' "$name"; return 0; }
+        done <<EOF
+$(cd "$dir" 2>/dev/null && find . -maxdepth 3 \( -name node_modules -o -name .git \) -prune -o -type f -name '*.prisma' -print 2>/dev/null | head -n 5)
+EOF
+    fi
+    printf 'DATABASE_URL'
+}
+
+# ---------------------------------------------------------------------------------------------
+# Reminders at the moment they matter
+# ---------------------------------------------------------------------------------------------
+
+# Files that are migrations or a schema a migration tool generates from.
+MIGRATION_PATH_RE='(^|/)(migrations|migrate|alembic/versions)/[^/]+|\.prisma$|(^|/)drizzle/[^/]*\.sql$'
+
+# Commands that write a new migration.
+MIGRATION_CMD_RE='prisma[[:space:]]+migrate[[:space:]]+dev|drizzle-kit[[:space:]]+generate|rails[[:space:]]+(generate|g)[[:space:]]+migration|manage\.py[[:space:]]+makemigrations|alembic[[:space:]]+revision|artisan[[:space:]]+make:migration|supabase[[:space:]]+migration[[:space:]]+new|knex[[:space:]]+migrate:make|sequelize(-cli)?[[:space:]]+migration:(generate|create)|ecto\.gen\.migration|typeorm[[:space:]].*migration:(generate|create)|wrangler[[:space:]]+d1[[:space:]]+migrations[[:space:]]+create|goose[[:space:]].*[[:space:]]create[[:space:]]|dbmate[[:space:]]+new|(^|[;&|[:space:]])migrate[[:space:]]+create'
+
+# Talking to a database directly instead of through TableStudio.
+RAW_CLIENT_RE='(^|[^[:alnum:]_.-])(psql|mysql|mariadb|sqlite3|clickhouse-client|clickhouse[[:space:]]+client)([^[:alnum:]_-]|$)'
+
+# after-tool: the agent just wrote a migration, or generated one. That's the moment it decides the
+# change is done, and the moment TableStudio can say whether the real data agrees.
+after_tool() {
+    local file cmd what dir
+    dir="$(json_get cwd)"
+    [ -n "$dir" ] || dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+    file="$(json_get tool_input.file_path)"
+    [ -n "$file" ] || file="$(json_get tool_input.path)"
+    if [ -n "$file" ]; then
+        case "$file" in */node_modules/* | */.git/* | */__init__.py) return 0 ;; esac
+        printf '%s' "$file" | grep -Eq "$MIGRATION_PATH_RE" || return 0
+        what="${file#"$dir"/}"
+    else
+        cmd="$(json_get tool_input.command)"
+        [ -n "$cmd" ] || return 0
+        case "$cmd" in
+            *"*** Begin Patch"*)
+                # Codex edits files with apply_patch, so the file names are in the patch itself.
+                file="$(printf '%s\n' "$cmd" | sed -nE 's/^\*\*\* (Add File|Update File|Move to): (.*)$/\2/p' |
+                    grep -Ev '(^|/)(node_modules|\.git)/|__init__\.py$' | grep -E "$MIGRATION_PATH_RE" | head -n 1)"
+                [ -n "$file" ] || return 0
+                what="${file#"$dir"/}" ;;
+            *)
+                printf '%s' "$cmd" | grep -Eq "$MIGRATION_CMD_RE" || return 0
+                what="$(printf '%s' "$cmd" | head -n 1 | cut -c 1-100)" ;;
+        esac
+    fi
+    ts_enabled || return 0
+    once migration || return 0
+    emit_tool_context PostToolUse "TableStudio: you just changed a database migration (${what}). The local database it runs against is usually small or empty, and real data is where migrations fail or lock. Before you call it done, check it read-only against the database it will deploy to, with TableStudio's tools:
+- get_table_ddl for each table it alters: rows, indexes, and what references it.
+- For each constraint it adds (NOT NULL, UNIQUE, a foreign key, a CHECK or a narrower type), execute_query the SELECT that finds rows breaking it. Any rows means the deploy would fail: add a backfill or cleanup step first.
+- On PostgreSQL, flag any step that rewrites or locks a big table (type changes, volatile defaults, CREATE INDEX without CONCURRENTLY) and use the safe pattern.
+- If it's risky, run it for real on a copy: create_sandbox from that connection (data: \"sample\"), execute the migration there, then compare_schemas.
+Tell the user what you checked and found. Apply it only to the local development database. Details: the database-workflow skill, \"Check a migration against real data\". (Shown once per session.)"
+}
+
+# cli_nudge <cmd> — the first time a session runs a database CLI directly, point at TableStudio.
+cli_nudge() {
+    local client
+    client="$(printf '%s' "$1" | grep -Eo "$RAW_CLIENT_RE" | head -n 1 | tr -cd '[:alnum:]-')"
+    [ -n "$client" ] || return 0
+    printf '%s' "$1" | grep -Eq '(^|[[:space:]])(--version|-V|--help|-\?)([[:space:]]|$)' && return 0
+    ts_enabled || return 0
+    once cli || return 0
+    emit_tool_context PreToolUse "TableStudio: this ran ${client} directly. Unless the user asked for the CLI, use TableStudio's tools for this project's databases: execute_query on the saved connection (the Database context note names it) needs no credentials and caps the result, and for a write, preflight_statement first shows exactly which rows it would change. (Shown once per session.)"
+}
+
+# ---------------------------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------------------------
+
+# mcp-headers: Claude Code runs this (the server's headersHelper) each time it connects, and again
+# after a 401, so a regenerated token is picked up on its own.
+mcp_headers() {
+    local port token
+    port="$(url_port "${CLAUDE_CODE_MCP_SERVER_URL:-}")"
+    case "$port" in '' | *[!0-9]*) port=$DEFAULT_PORT ;; esac
+    [ "$(probe_server "$port")" = down ] && maybe_open_app "$port" "$PWD"
+    if ! token="$(ts_token)"; then
+        echo "TableStudio's MCP token wasn't found. Open TableStudio and turn on Settings → MCP." >&2
+        return 1
+    fi
+    printf '{"Authorization":"Bearer %s","X-TableStudio-Client":"%s","X-TableStudio-Project":"%s"}\n' \
+        "$token" "$(client_id)" "$(json_escape "$PWD")"
+}
+
+# connect-cursor: Cursor can't take a token from a plugin, so open its own one-click install link
+# (the same one TableStudio's Settings → MCP → Cursor button opens). The token stays out of output.
+connect_cursor() {
+    local token port config encoded
+    if ! token="$(ts_token)"; then
+        echo "TableStudio's MCP token isn't set yet. Ask the user to open TableStudio and turn on Settings → MCP, then try again."
+        return 1
+    fi
+    port="$(ts_pref mcpServerPort)"
+    case "$port" in '' | *[!0-9]*) port=$DEFAULT_PORT ;; esac
+    config="$(printf '{"url":"http://localhost:%s","headers":{"Authorization":"Bearer %s"}}' "$port" "$token")"
+    encoded="$(printf '%s' "$config" | base64 | tr -d '\n' | sed 's/+/%2B/g; s|/|%2F|g; s/=/%3D/g')"
+    if ! open "cursor://anysphere.cursor-deeplink/mcp/install?name=tablestudio&config=${encoded}" 2>/dev/null; then
+        echo "Couldn't open Cursor. Ask the user to click Cursor in TableStudio → Settings → MCP instead."
+        return 1
+    fi
+    echo "Opened Cursor's prompt to add TableStudio's MCP server (localhost:${port}). Ask the user to confirm it in Cursor; TableStudio's tools are available once it's added."
+}
+
+# mcp-stdio <client>: an MCP server on stdin/stdout that forwards every message to TableStudio's
+# local HTTP server. For clients that can launch a command but can't compute a header (Cursor,
+# OpenCode, Claude Desktop, and anything else that speaks stdio): the token is read from the app
+# for each message, so it never sits in a config file, and a regenerated one is picked up at once.
+# Each message is one line of JSON-RPC; responses go back the same way, one per line.
+mcp_stdio() {
+    local port tmp line token code protocol="" opened=0 ctype bridge
+    port="$(plugin_port)"
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/tablestudio-mcp.XXXXXX")" || return 1
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmp'" EXIT
+    bridge="$(uuidgen 2>/dev/null || printf '%s-%s' "$$" "$(date +%s)")"
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        [ -n "$line" ] || continue
+        INPUT="$line"
+        printf '%s' "$line" >"$tmp/request"
+        token="$(ts_token)"
+        code="$(forward_mcp "$port" "$token" "$protocol" "$bridge" "$tmp")"
+        if [ "$code" = 000 ] && [ "$opened" = 0 ]; then
+            opened=1
+            maybe_open_app "$port" "$PWD" && code="$(forward_mcp "$port" "$(ts_token)" "$protocol" "$bridge" "$tmp")"
+        fi
+        case "$code" in
+            200)
+                ctype="$(grep -i '^content-type:' "$tmp/headers" 2>/dev/null | tail -n 1)"
+                case "$ctype" in
+                    *event-stream*) sed -n 's/^data: \{0,1\}//p' "$tmp/body" | grep -v '^[[:space:]]*$' ;;
+                    *) tr -d '\r\n' <"$tmp/body"; printf '\n' ;;
+                esac
+                if [ -z "$protocol" ] && [ "$(json_get method)" = initialize ]; then
+                    protocol="$(grep -Eo '"protocolVersion"[[:space:]]*:[[:space:]]*"[^"]+"' "$tmp/body" | head -n 1 | sed -E 's/.*"([^"]+)"$/\1/')"
+                fi ;;
+            202 | 204) ;;
+            401 | 403) mcp_error "TableStudio refused its own MCP token: another app may hold localhost:${port}, or a second copy of TableStudio is running. Check TableStudio → Settings → MCP." ;;
+            000) mcp_error "TableStudio isn't answering on localhost:${port}. Open TableStudio and make sure Settings → MCP is on; this connection picks it up on the next call." ;;
+            *) mcp_error "TableStudio's MCP server answered HTTP ${code}: $(head -c 300 "$tmp/body" 2>/dev/null)" ;;
+        esac
+    done
+}
+
+# forward_mcp <port> <token> <protocol version> <bridge id> <tmp dir> — POSTs tmp/request, leaves
+# the response in tmp/body and tmp/headers, prints the HTTP status (000 when nothing answered). The
+# token goes to curl on stdin so it never appears in `ps`.
+forward_mcp() {
+    local project
+    project="$(printf '%s' "$PWD" | LC_ALL=C tr -d '\000-\037')"
+    : >"$5/body"; : >"$5/headers"
+    {
+        [ -n "$2" ] && printf 'header = "Authorization: Bearer %s"\n' "$2"
+        [ -n "$3" ] && printf 'header = "MCP-Protocol-Version: %s"\n' "$3"
+    } | curl -s -o "$5/body" -D "$5/headers" -w '%{http_code}' --max-time 900 -K - \
+        -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+        -H "X-TableStudio-Client: $(client_id)" -H "X-TableStudio-Bridge: $4" \
+        -H "X-TableStudio-Project: $project" \
+        --data-binary "@$5/request" "http://127.0.0.1:${1}/" 2>/dev/null || true
+}
+
+# mcp_error <message> — a JSON-RPC error for the request in INPUT. Notifications get nothing back.
+mcp_error() {
+    local id
+    id="$(json_get id)" || return 0
+    [ -n "$id" ] || return 0
+    case "$id" in
+        *[!0-9-]* | "" | -) id="\"$(json_escape "$id")\"" ;;
+    esac
+    printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"%s"}}\n' "$id" "$(json_escape "$1")"
+}
+
+# The client name TableStudio shows in its Agent Center.
+client_id() {
+    case "$CLIENT" in
+        claude) echo claude-code ;;
+        *) printf '%s' "$CLIENT" ;;
+    esac
+}
+
+# agent-event <client>: tells TableStudio which chat is making its tool calls, so its Agent Center
+# can show each call under the conversation that made it and offer to reopen it. The client's own
+# hook payload goes as it is (session id, cwd, transcript path, tool name and input), and TableStudio
+# reads the fields it knows. Fire and forget: it never delays the tool call, never prints, and
+# does nothing when TableStudio's MCP server is off.
+agent_event() {
+    local token port file name
+    # Claude Code, Codex and OpenCode put the server in the tool's name; Cursor names it apart.
+    name="$(json_get mcp_server_name) $(json_get tool_name) $(json_get tool)"
+    case "$(lower "$name")" in *tablestudio*) ;; *) return 0 ;; esac
+    ts_enabled || return 0
+    token="$(ts_token)" || return 0
+    port="$(plugin_port)"
+    file="$(mktemp "${TMPDIR:-/tmp}/tablestudio-event.XXXXXX")" || return 0
+    # Over 256 KB the payload is mostly a tool result TableStudio already has; the ids are enough.
+    if [ "${#INPUT}" -gt 262144 ]; then
+        printf '{"client":"%s","hook":{"session_id":"%s","conversation_id":"%s","tool_use_id":"%s","tool_name":"%s","cwd":"%s"}}' \
+            "$(client_id)" "$(json_escape "$(json_get session_id)")" "$(json_escape "$(json_get conversation_id)")" \
+            "$(json_escape "$(json_get tool_use_id)")" "$(json_escape "$name")" "$(json_escape "$(json_get cwd)")" >"$file"
+    else
+        printf '{"client":"%s","hook":%s}' "$(client_id)" "$INPUT" >"$file"
+    fi
+    (
+        printf 'header = "Authorization: Bearer %s"\n' "$token" |
+            curl -s -o /dev/null --max-time 3 -K - -H 'Content-Type: application/json' \
+                --data-binary "@$file" "http://127.0.0.1:${port}/agent/events" 2>/dev/null
+        rm -f "$file"
+    ) >/dev/null 2>&1 </dev/null &
+}
+
+# ---------------------------------------------------------------------------------------------
+# install / doctor
+# ---------------------------------------------------------------------------------------------
+
+# The marketplace root (this repository) and the plugin inside it.
+KIT_ROOT="$(cd "$(dirname "$SCRIPT_PATH")/../.." 2>/dev/null && pwd)"
+KIT_PLUGIN="$KIT_ROOT/tablestudio"
+OPENCODE_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json"
+CURSOR_LOCAL_PLUGIN="$HOME/.cursor/plugins/local/tablestudio"
+
+say() { printf '%s\n' "$*"; }
+ok() { printf '  \342\234\223 %s\n' "$*"; }
+no() { printf '  \342\234\227 %s\n' "$*"; }
+todo() { printf '    \342\206\222 %s\n' "$*"; }
+
+cursor_app() {
+    local app
+    for app in /Applications/Cursor.app "$HOME/Applications/Cursor.app"; do
+        [ -d "$app" ] && { printf '%s' "$app"; return 0; }
+    done
+    return 1
+}
+
+# Which coding agents are on this Mac.
+detected_clients() {
+    local found=""
+    command -v claude >/dev/null 2>&1 && found="$found claude"
+    { cursor_app >/dev/null || [ -d "$HOME/.cursor" ]; } && found="$found cursor"
+    command -v codex >/dev/null 2>&1 && found="$found codex"
+    command -v opencode >/dev/null 2>&1 && found="$found opencode"
+    printf '%s' "${found# }"
+}
+
+# install [claude|cursor|codex|opencode]… — puts the plugin into each agent (every one found when
+# none are named), then runs doctor. Safe to run again: it updates what's there.
+install_agents() {
+    local clients="$*" client
+    [ -n "$clients" ] || clients="$(detected_clients)"
+    if [ -z "$clients" ]; then
+        say "No coding agent found (Claude Code, Cursor, Codex or OpenCode). Install one, then run this again."
+        return 1
+    fi
+    for client in $clients; do
+        case "$client" in
+            claude | claude-code) install_claude ;;
+            cursor) install_cursor ;;
+            codex) install_codex ;;
+            opencode) install_opencode ;;
+            *) say "Unknown agent: $client (use claude, cursor, codex or opencode)" ;;
+        esac
+    done
+    say ""
+    doctor
+}
+
+install_claude() {
+    say "Claude Code"
+    command -v claude >/dev/null 2>&1 || { no "the claude command isn't installed"; return; }
+    if claude plugin marketplace list 2>/dev/null | grep -q 'tablestudio'; then
+        claude plugin marketplace update tablestudio >/dev/null 2>&1
+    else
+        claude plugin marketplace add "$KIT_ROOT" >/dev/null 2>&1 || { no "couldn't add the marketplace"; return; }
+    fi
+    if claude plugin install tablestudio@tablestudio >/dev/null 2>&1; then
+        ok "plugin installed: skills, hooks, and TableStudio's MCP server with no token to copy"
+        todo "in a running Claude Code session: /reload-plugins (new sessions pick it up on their own)"
+    else
+        no "couldn't install the plugin"
+        todo "in Claude Code: /plugin install tablestudio@tablestudio"
+    fi
+}
+
+install_cursor() {
+    say "Cursor"
+    mkdir -p "$(dirname "$CURSOR_LOCAL_PLUGIN")" 2>/dev/null
+    rm -rf "$CURSOR_LOCAL_PLUGIN" 2>/dev/null
+    # A copy, not a link: Cursor reads local plugins from this folder, and a copy keeps working if
+    # this checkout moves. Running install again refreshes it.
+    if cp -R "$KIT_PLUGIN" "$CURSOR_LOCAL_PLUGIN" 2>/dev/null; then
+        ok "plugin copied to ~/.cursor/plugins/local/tablestudio: skills, rules, hooks, MCP server"
+        todo "in Cursor: Developer: Reload Window, then check Customize for TableStudio"
+    else
+        no "couldn't write ~/.cursor/plugins/local"
+    fi
+}
+
+install_codex() {
+    say "Codex"
+    command -v codex >/dev/null 2>&1 || { no "the codex command isn't installed"; return; }
+    if codex plugin marketplace list 2>/dev/null | grep -q 'tablestudio'; then
+        codex plugin marketplace upgrade tablestudio >/dev/null 2>&1
+    else
+        codex plugin marketplace add "$KIT_ROOT" >/dev/null 2>&1 || { no "couldn't add the marketplace"; return; }
+    fi
+    if codex plugin add tablestudio@tablestudio >/dev/null 2>&1; then
+        ok "plugin installed: skills, hooks, and TableStudio's MCP server"
+        todo "in Codex: run /hooks and trust TableStudio's hooks, then start a new session"
+    else
+        no "couldn't install the plugin"
+        todo "codex plugin add tablestudio@tablestudio"
+    fi
+}
+
+install_opencode() {
+    say "OpenCode"
+    local dir="$KIT_PLUGIN/opencode" result
+    mkdir -p "$(dirname "$OPENCODE_CONFIG")" 2>/dev/null
+    # JSON edited with JavaScript for Automation, which every Mac has. A config with comments
+    # (JSONC) isn't touched; the fix is printed instead.
+    result="$(osascript -l JavaScript - "$OPENCODE_CONFIG" "$dir" 2>&1 <<'JXA'
+function run(argv) {
+  var file = argv[0], entry = argv[1], fm = $.NSFileManager.defaultManager, config = {};
+  if (fm.fileExistsAtPath(file)) {
+    var text = $.NSString.stringWithContentsOfFileEncodingError(file, $.NSUTF8StringEncoding, null);
+    try { config = JSON.parse(text.js); } catch (e) { return "unparseable"; }
+  }
+  var list = config.plugins || config.plugin || [];
+  var has = list.some(function (p) { var s = typeof p === "string" ? p : (p && p.package) || ""; return s.indexOf("tablestudio") >= 0; });
+  if (has) return "present";
+  if (config.plugin && !config.plugins) { config.plugin.push(entry); } else { config.plugins = list.concat([entry]); }
+  if (!config["$schema"]) config["$schema"] = "https://opencode.ai/config.json";
+  $.NSString.alloc.initWithUTF8String(JSON.stringify(config, null, 2) + "\n").writeToFileAtomicallyEncodingError(file, true, $.NSUTF8StringEncoding, null);
+  return "added";
+}
+JXA
+)"
+    case "$result" in
+        added | present)
+            if [ "$result" = added ]; then ok "plugin added to ${OPENCODE_CONFIG/#$HOME/~}: skills, database note, shell guard, MCP server"
+            else ok "plugin already in ${OPENCODE_CONFIG/#$HOME/~}"; fi
+            command -v opencode >/dev/null 2>&1 && opencode reload >/dev/null 2>&1
+            todo "restart OpenCode, or run: opencode reload" ;;
+        unparseable)
+            no "${OPENCODE_CONFIG/#$HOME/~} has comments, so it wasn't edited"
+            todo "add \"$dir\" to its \"plugins\" list" ;;
+        *)
+            no "couldn't edit ${OPENCODE_CONFIG/#$HOME/~}: $result" ;;
+    esac
+}
+
+# doctor — what's set up, what isn't, and the command that fixes each.
+doctor() {
+    local port state
+    port="$(ts_pref mcpServerPort)"
+    case "$port" in '' | *[!0-9]*) port=$DEFAULT_PORT ;; esac
+    say "TableStudio"
+    if ! app_installed && [ -z "$(ts_pref mcpServerEnabled)" ]; then
+        no "TableStudio isn't installed"
+        todo "get it at https://tablestudio.sh"
+    elif [ "$(ts_pref mcpServerEnabled)" != 1 ]; then
+        no "its MCP server is off"
+        todo "TableStudio → Settings → MCP → turn it on"
+    else
+        state="$(probe_server "$port")"
+        case "$state" in
+            running) ok "MCP server answering on localhost:$port" ;;
+            unauthorized) no "localhost:$port refused TableStudio's own token: another app on that port?" ;;
+            *) no "MCP server isn't answering on localhost:$port"; todo "open TableStudio" ;;
+        esac
+        ts_token >/dev/null && ok "agents read the MCP token from the app; it isn't in any config file"
+    fi
+    say ""
+    say "Agents"
+    if command -v claude >/dev/null 2>&1; then
+        if claude plugin list 2>/dev/null | grep -q 'tablestudio'; then ok "Claude Code: plugin installed"
+        else no "Claude Code: plugin not installed"; todo "$KIT_ROOT/install.sh claude"; fi
+        claude_has_manual_server "$port" "$PWD" && todo "Claude Code also has a hand-added entry; remove it: claude mcp remove tablestudio"
+    else
+        no "Claude Code: not on this Mac"
+    fi
+    if cursor_app >/dev/null || [ -d "$HOME/.cursor" ]; then
+        if [ -f "$CURSOR_LOCAL_PLUGIN/.cursor-plugin/plugin.json" ]; then ok "Cursor: plugin installed (local)"
+        else no "Cursor: plugin not installed"; todo "$KIT_ROOT/install.sh cursor"; fi
+        cursor_has_server "$port" "$PWD" && todo "Cursor also has a hand-added entry in ~/.cursor/mcp.json; remove it so tools don't appear twice"
+    else
+        no "Cursor: not on this Mac"
+    fi
+    if command -v codex >/dev/null 2>&1; then
+        if codex plugin list 2>/dev/null | grep 'tablestudio@tablestudio' | grep -vq 'not installed'; then ok "Codex: plugin installed (trust its hooks with /hooks)"
+        else no "Codex: plugin not installed"; todo "$KIT_ROOT/install.sh codex"; fi
+        codex_has_manual_server "$port" && todo "Codex also has a hand-added [mcp_servers] entry in ~/.codex/config.toml; remove it"
+    else
+        no "Codex: not on this Mac"
+    fi
+    if command -v opencode >/dev/null 2>&1; then
+        if grep -q 'tablestudio' "$OPENCODE_CONFIG" 2>/dev/null; then ok "OpenCode: plugin installed"
+        else no "OpenCode: plugin not installed"; todo "$KIT_ROOT/install.sh opencode"; fi
+    else
+        no "OpenCode: not on this Mac"
+    fi
+}
+
+# ---------------------------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------------------------
+
+emit_context() {
+    local text
+    text="$(json_escape "$1")"
+    if [ "$CLIENT" = "cursor" ]; then
+        printf '{"additional_context":"%s"}\n' "$text"
+    else
+        printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}\n' "$text"
+    fi
+}
+
+# emit_tool_context <PreToolUse|PostToolUse> <text> — context for the agent, no decision.
+emit_tool_context() {
+    local text
+    text="$(json_escape "$2")"
+    if [ "$CLIENT" = "cursor" ]; then
+        printf '{"additional_context":"%s"}\n' "$text"
+    else
+        printf '{"hookSpecificOutput":{"hookEventName":"%s","additionalContext":"%s"}}\n' "$1" "$text"
+    fi
+}
+
+# decide <allow|ask|deny> <reason>
+decide() {
+    local reason decision="$1" text="$2"
+    # Codex can't ask the user: it treats "ask" as a failed hook and runs the command anyway. So a
+    # write that would ask elsewhere is stopped, and the user runs it themselves if they meant it.
+    if [ "$CLIENT" = codex ] && [ "$decision" = ask ]; then
+        decision=deny
+        text="${text#TableStudio: }"
+        text="${text/ Allow it only if you expect a change there./}"
+        text="TableStudio stopped this command, because Codex can't ask the user to approve it: ${text} If the user wants this exact command run, ask them to run it themselves."
+    fi
+    reason="$(json_escape "$text")"
+    set -- "$decision" "$text"
+    if [ "$CLIENT" = "cursor" ]; then
+        printf '{"permission":"%s","user_message":"%s","agent_message":"%s"}\n' "$1" "$reason" "$reason"
+    else
+        printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"%s","permissionDecisionReason":"%s"}}\n' "$1" "$reason"
+    fi
+}
+
+# ---------------------------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------------------------
+
+case "$EVENT" in
+    session-start)
+        output="$(session_start 2>/dev/null)"
+        [ -n "$output" ] && printf '%s\n' "$output"
+        ;;
+    guard-shell)
+        output="$(guard_shell 2>/dev/null)"
+        # Cursor's shell hook can't add context, so the reminder is for Claude Code and Codex.
+        if [ -z "$output" ] && [ "$CLIENT" != "cursor" ]; then
+            output="$(cli_nudge "$(strip_text_tools "$(strip_heredocs "$(json_get tool_input.command)")")" 2>/dev/null)"
+        fi
+        # Cursor treats a permission hook's empty output as a refusal, so say "allow" explicitly.
+        # Claude Code reads empty output as "no opinion", which leaves its own permission rules in charge.
+        if [ -z "$output" ] && [ "$CLIENT" = "cursor" ]; then output='{"permission":"allow"}'; fi
+        [ -n "$output" ] && printf '%s\n' "$output"
+        ;;
+    after-tool)
+        output="$(after_tool 2>/dev/null)"
+        [ -n "$output" ] && printf '%s\n' "$output"
+        ;;
+    mcp-headers)
+        # The one command whose exit status matters: without a token, Claude Code should report
+        # the server as failed rather than connect without one.
+        mcp_headers
+        exit $?
+        ;;
+    connect-cursor)
+        connect_cursor
+        exit $?
+        ;;
+    mcp-stdio)
+        mcp_stdio
+        exit $?
+        ;;
+    agent-event)
+        agent_event 2>/dev/null
+        ;;
+    install)
+        shift
+        install_agents "$@"
+        exit $?
+        ;;
+    doctor)
+        doctor
+        ;;
+esac
+exit 0

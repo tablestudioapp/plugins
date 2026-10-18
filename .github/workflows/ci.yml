@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS parses hook input with plutil; Linux exercises the jq fallback.
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Hook tests
+        run: tests/run.sh -v
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: shellcheck -S error tablestudio/scripts/tablestudio-hook tests/run.sh install.sh
+      - name: OpenCode plugin parses
+        run: node --check tablestudio/opencode/index.js
+      - name: JSON files parse
+        run: |
+          for f in .claude-plugin/marketplace.json .cursor-plugin/marketplace.json \
+                   tablestudio/.claude-plugin/plugin.json tablestudio/.cursor-plugin/plugin.json \
+                   tablestudio/.mcp.json tablestudio/hooks/hooks.json tablestudio/hooks/cursor-hooks.json \
+                   tablestudio/.codex-plugin/plugin.json tablestudio/codex-mcp.json tablestudio/hooks/codex-hooks.json \
+                   .agents/plugins/marketplace.json tablestudio/cursor-mcp.json package.json \
+                   tablestudio/opencode/package.json; do
+            jq -e . "$f" > /dev/null || { echo "invalid JSON: $f"; exit 1; }
+          done

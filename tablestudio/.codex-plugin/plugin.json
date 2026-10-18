@@ -1,0 +1,36 @@
+{
+  "name": "tablestudio",
+  "version": "0.4.0",
+  "description": "Your coding agent works on your databases through the TableStudio app: reads run read-only in the database, writes are dry-run against the real rows, production changes go to your review in TableStudio's Agent Center, and the shell can't write to production.",
+  "keywords": [
+    "database",
+    "postgres",
+    "mysql",
+    "sqlite",
+    "clickhouse",
+    "d1",
+    "mcp",
+    "migrations",
+    "sql"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./codex-mcp.json",
+  "hooks": "./hooks/codex-hooks.json",
+  "interface": {
+    "displayName": "TableStudio",
+    "shortDescription": "Safe database work through the TableStudio app",
+    "longDescription": "Connects Codex to TableStudio, the native macOS database client. Codex learns which saved connection each of the repo's databases is, dry-runs writes against the real rows, checks new migrations against real data, and sends risky changes to your review inbox in TableStudio. A shell guard stops writes to remote and production databases.",
+    "developerName": "TableStudio",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://tablestudio.sh",
+    "logo": "./assets/icon.png",
+    "defaultPrompt": [
+      "Which TableStudio connection is this project's database?",
+      "Check my latest migration against the real data before I deploy it."
+    ]
+  }
+}

@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>mcpAuthToken</key>
+	<string>test-token-0000</string>
+	<key>mcpServerEnabled</key>
+	<true/>
+	<key>mcpServerPort</key>
+	<integer>1</integer>
+	<key>postgres_connections</key>
+	<data>
+	W3siaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJuYW1l
+	IjoiQWNtZSBsb2NhbCIsImtpbmQiOiJwb3N0Z3JlcyIsImhvc3QiOiJsb2NhbGhvc3Qi
+	LCJwb3J0Ijo1NDMyLCJkYXRhYmFzZSI6ImFwcCIsInVzZXJuYW1lIjoiYXBwIiwicGFz
+	c3dvcmQiOiIiLCJlbnZpcm9ubWVudCI6ImRldmVsb3BtZW50IiwicmVhZE9ubHkiOmZh
+	bHNlLCJpc1NhbmRib3giOmZhbHNlfSx7ImlkIjoiMjIyMjIyMjItMjIyMi00MjIyLTgy
+	MjItMjIyMjIyMjIyMjIyIiwibmFtZSI6IkFjbWUgcHJvZCIsImtpbmQiOiJwb3N0Z3Jl
+	cyIsImhvc3QiOiJkYi5hY21lLWludGVybmFsLmNvbSIsInBvcnQiOjU0MzIsImRhdGFi
+	YXNlIjoiYWNtZSIsInVzZXJuYW1lIjoicHJvZF91c2VyIiwicGFzc3dvcmQiOiIiLCJl
+	bnZpcm9ubWVudCI6InByb2R1Y3Rpb24iLCJyZWFkT25seSI6dHJ1ZSwiaXNTYW5kYm94
+	IjpmYWxzZSwicHJvamVjdElEIjoiQUFBQUFBQUEtQUFBQS00QUFBLThBQUEtQUFBQUFB
+	QUFBQUFBIn0seyJpZCI6IjMzMzMzMzMzLTMzMzMtNDMzMy04MzMzLTMzMzMzMzMzMzMz
+	MyIsIm5hbWUiOiJBY21lIHNhbmRib3giLCJraW5kIjoicG9zdGdyZXMiLCJob3N0Ijoi
+	bG9jYWxob3N0IiwicG9ydCI6NTQzMiwiZGF0YWJhc2UiOiJhcHAiLCJwYXNzd29yZCI6
+	IiIsImlzU2FuZGJveCI6dHJ1ZX0seyJpZCI6IjQ0NDQ0NDQ0LTQ0NDQtNDQ0NC04NDQ0
+	LTQ0NDQ0NDQ0NDQ0NCIsIm5hbWUiOiJXaWRnZXRzIEQxIiwia2luZCI6ImQxIiwiaG9z
+	dCI6IiIsInBvcnQiOjAsImRhdGFiYXNlIjoiIiwicGFzc3dvcmQiOiIiLCJpc1NhbmRi
+	b3giOmZhbHNlLCJkMURhdGFiYXNlSUQiOiJkMS13aWRnZXRzLWlkIn0seyJpZCI6IjU1
+	NTU1NTU1LTU1NTUtNDU1NS04NTU1LTU1NTU1NTU1NTU1NSIsIm5hbWUiOiJBbmFseXRp
+	Y3MiLCJraW5kIjoicG9zdGdyZXMiLCJob3N0IjoiYW5hbHl0aWNzLmV4YW1wbGUuY29t
+	IiwicG9ydCI6NTQzMiwiZGF0YWJhc2UiOiJhbmFseXRpY3MiLCJ1c2VybmFtZSI6ImFu
+	YWx5c3QiLCJwYXNzd29yZCI6IiIsImVudmlyb25tZW50IjoicHJvZHVjdGlvbiIsImlz
+	U2FuZGJveCI6ZmFsc2UsInByb2plY3RJRCI6IkFBQUFBQUFBLUFBQUEtNEFBQS04QUFB
+	LUFBQUFBQUFBQUFBQSJ9XQo=
+	</data>
+	<key>postgres_projects</key>
+	<data>
+	W3siaWQiOiJBQUFBQUFBQS1BQUFBLTRBQUEtOEFBQS1BQUFBQUFBQUFBQUEiLCJuYW1l
+	IjoiUHJvamVjdCJ9XQ==
+	</data>
+</dict>
+</plist>

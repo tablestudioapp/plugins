@@ -1,0 +1,17 @@
+{
+  "name": "tablestudio",
+  "owner": {
+    "name": "TableStudio",
+    "url": "https://tablestudio.sh"
+  },
+  "metadata": {
+    "description": "Plugins from TableStudio, the native macOS database client."
+  },
+  "plugins": [
+    {
+      "name": "tablestudio",
+      "source": "tablestudio",
+      "description": "Your coding agent works on your databases through TableStudio: it knows which saved connection each of the repo's databases is, dry-runs writes, checks new migrations against real data, stages risky changes for your review, and can't write to production from the shell."
+    }
+  ]
+}

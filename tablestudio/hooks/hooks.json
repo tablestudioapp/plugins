@@ -1,0 +1,71 @@
+{
+  "description": "TableStudio: database context when a session starts, a guard on shell commands that write to remote or production databases, a reminder to check new migrations against real data, and which chat made each TableStudio call (for its Agent Center).",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/bash",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/tablestudio-hook",
+              "session-start",
+              "claude"
+            ],
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/bash",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/tablestudio-hook",
+              "guard-shell",
+              "claude"
+            ],
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__plugin_tablestudio_tablestudio__.*|mcp__tablestudio__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/bash",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/tablestudio-hook",
+              "agent-event",
+              "claude"
+            ],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/bash",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/tablestudio-hook",
+              "after-tool",
+              "claude"
+            ],
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

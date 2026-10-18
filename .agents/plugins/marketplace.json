@@ -1,0 +1,20 @@
+{
+  "name": "tablestudio",
+  "interface": {
+    "displayName": "TableStudio"
+  },
+  "plugins": [
+    {
+      "name": "tablestudio",
+      "source": {
+        "source": "local",
+        "path": "./tablestudio"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

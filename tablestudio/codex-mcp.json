@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "tablestudio": {
+      "type": "http",
+      "url": "http://localhost:7432",
+      "http_headers_helper": "printf '{\"Authorization\":\"Bearer %s\",\"X-TableStudio-Client\":\"codex\"}' \"$(/usr/bin/defaults read sh.tablestudio mcpAuthToken 2>/dev/null)\""
+    }
+  }
+}
