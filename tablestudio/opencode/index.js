@@ -10,8 +10,9 @@
 // - The shell guard, as a permission rule: shell commands that write to production are denied, and
 //   writes to other remote databases ask the user, using OpenCode's own approval prompt.
 // - The migration reminder, once per session, after the agent edits a migration file.
-// - Attribution: each TableStudio tool call is reported with its session id, so TableStudio's
-//   Agent Center can show it under the OpenCode conversation that made it.
+// - Attribution: each TableStudio tool call is reported with its session id and the
+//   conversation's first prompt, so TableStudio's Agent Center can show it under the OpenCode
+//   conversation that made it, titled.
 //
 // Every step fails open: if the hook script errors, OpenCode behaves as if the plugin weren't there.
 
@@ -94,6 +95,27 @@ function readSkills() {
   })
 }
 
+/** The first piece of text in a prompt, whatever shape OpenCode gives it: the conversation's title. */
+function promptText(value, depth = 0) {
+  if (depth > 6 || value == null) return undefined
+  if (typeof value === "string") return value.trim() || undefined
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const text = promptText(item, depth + 1)
+      if (text) return text
+    }
+    return undefined
+  }
+  if (typeof value === "object") {
+    if (typeof value.text === "string" && value.text.trim()) return value.text.trim()
+    for (const key of ["parts", "content", "prompt", "input"]) {
+      const text = promptText(value[key], depth + 1)
+      if (text) return text
+    }
+  }
+  return undefined
+}
+
 function toolInputPath(input) {
   if (!input || typeof input !== "object") return undefined
   return input.filePath ?? input.file_path ?? input.path
@@ -135,6 +157,13 @@ export default {
     const note = runHook(["session-start", "opencode"], { source: "startup", cwd: directory }, directory)
       .then((text) => hookOutput(text).additionalContext ?? "")
     const reminders = new Map()
+    // The first thing asked in each conversation, sent with its TableStudio calls as the title.
+    const titles = new Map()
+    await register("prompt", ctx.session.hook("prompt", guarded("prompt", (prompt) => {
+      if (titles.has(prompt.sessionID)) return
+      const text = promptText(prompt.prompt)
+      if (text) titles.set(prompt.sessionID, text.split("\n")[0].slice(0, 120))
+    })))
     await register("context", ctx.session.hook("context", guarded("context", async (request) => {
       const text = await note
       if (text && !request.system.some((part) => part?.text === text)) request.system.push({ type: "text", text })
@@ -174,6 +203,7 @@ export default {
           tool_name: call.tool,
           tool_input: call.input,
           status: call.status,
+          title: titles.get(call.sessionID),
           cwd: directory,
         }, directory, 5000)
         return
