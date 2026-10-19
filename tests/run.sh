@@ -236,6 +236,12 @@ ctx="$(start claude "$EMPTY")"
 ctx="$(start claude "$PROJECT" resume)"
 [ -z "$ctx" ]; report $((1 - $?)) "silent on resume" "got: $ctx"
 
+echo "Plugin version"
+# Codex's header helper can't read the manifest, so its version is written into codex-mcp.json.
+manifest_version="$(jq -r .version tablestudio/.claude-plugin/plugin.json)"
+jq -r '.mcpServers.tablestudio.http_headers_helper' tablestudio/codex-mcp.json | grep -qF "\"X-TableStudio-Plugin\":\"$manifest_version\""
+report $((1 - $?)) "codex-mcp.json sends the manifest's version ($manifest_version)" "update X-TableStudio-Plugin in tablestudio/codex-mcp.json"
+
 if [ "$ON_MAC" = 1 ]; then
     echo "Session start: no database in the folder"
     # A copy of the prefs where the user turned agent access off for one connection.

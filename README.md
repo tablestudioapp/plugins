@@ -18,7 +18,7 @@ You need TableStudio for macOS with its MCP server on (**Settings → MCP**).
 **Everything at once.** Installs into every agent it finds on your Mac, then checks the setup:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/tablestudioapp/plugins/main/install.sh | bash
+curl -fsSL https://tablestudio.sh/install | bash
 ```
 
 Or from a checkout: `./install.sh` (all), `./install.sh cursor opencode` (some), `./install.sh --doctor` (just check). Run it again to update.
@@ -160,6 +160,14 @@ claude --plugin-dir ./tablestudio     # try it in Claude Code without installing
 
 Layout: one plugin in `tablestudio/` serves every client. Claude Code reads `.claude-plugin/plugin.json`, `.mcp.json` and `hooks/hooks.json`; Cursor reads `.cursor-plugin/plugin.json`, `cursor-mcp.json`, `rules/` and `hooks/cursor-hooks.json`; Codex reads `.codex-plugin/plugin.json`, `codex-mcp.json` and `hooks/codex-hooks.json` (marketplace in `.agents/plugins/marketplace.json`); OpenCode loads `opencode/index.js` (through the root `package.json` when installed from git or npm). All of them share `skills/` and `scripts/tablestudio-hook`.
 
+### Releasing
+
+Work goes to `staging`. `main` is what users install, and every merge into it is a release.
+
+1. On `staging`, run `scripts/version.sh 0.5.2`. It sets the version in all six files that carry it and adds a `## 0.5.2` heading to CHANGELOG.md; write the notes under it.
+2. Open a pull request from `staging` into `main`. CI runs the tests and checks that the version is new and has notes.
+3. Merge it. CI tags `v0.5.2` and publishes the notes as a GitHub release.
+
 ## License
 
-MIT
+[PolyForm Shield 1.0.0](LICENSE): use, change and share it for anything except a product that competes with TableStudio.

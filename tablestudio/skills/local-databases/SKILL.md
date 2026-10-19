@@ -1,6 +1,6 @@
 ---
 name: local-databases
-description: Set up and manage local development databases on the user's Mac through TableStudio. Use when a project needs a local Postgres, MySQL, ClickHouse or SQLite database, or a DATABASE_URL for one; when a local database refuses connections or is stopped (ECONNREFUSED, "connection refused", "could not connect to server", "Can't connect to MySQL server"); when the user wants a scratch or test database or a safe copy to experiment on; or when a PostgreSQL extension (pgvector, PostGIS, pg_trgm) needs installing.
+description: Set up and manage local development databases on the user's Mac through TableStudio. Use when a project needs a local Postgres, MySQL, ClickHouse or SQLite database, or a DATABASE_URL for one; when a local database refuses connections or is stopped (ECONNREFUSED, "connection refused", "could not connect to server", "Can't connect to MySQL server"); when the user wants a local copy of a remote or production database to develop against; when the user wants a scratch or test database or a safe copy to experiment on; or when a PostgreSQL extension (pgvector, PostGIS, pg_trgm) needs installing.
 ---
 
 # Local databases with TableStudio
@@ -22,6 +22,7 @@ TableStudio manages database servers on this Mac, including ones it adopted from
 
 - `sqlite` needs nothing installed and is instant. Prefer it when the user just wants somewhere to put data.
 - `postgres`, `mysql` and `clickhouse` need that engine's server binaries already on the Mac. TableStudio bundles none, and the tool says so when they're missing. Pass the install hint on rather than installing software unasked.
+- When a local server of that engine is already running (`local_server` in `list_connections`, or `list_local_databases`), pass its `instance_id`: the database is created on it, instead of starting another server on another port.
 
 It returns a `connection_id` that's ready to query through TableStudio's tools, and `env_line` (`DATABASE_URL=…`) for the project itself. Then:
 
@@ -32,6 +33,17 @@ It returns a `connection_id` that's ready to query through TableStudio's tools, 
 Never repeat the connection string in chat, and never write it into code, docs or a commit.
 
 Don't call `stop_local_database` as cleanup or to free a port unless the user asked. It disconnects everything using that server, including the user's own windows.
+
+## A local copy of a remote or production database
+
+When the user wants to develop against a copy of a real database ("make me a local copy of production"), make a real local database and restore a full backup into it. Not `create_sandbox`: a sandbox is a throwaway copy on TableStudio's shared sandbox server, capped at `rows` rows per table, for experiments.
+
+1. The source: the connection the project's settings point at (the session note, or `list_connections`), or `add_connection` from the project's env file when TableStudio doesn't have it yet.
+2. Before copying, say what it means: production data, customer data included, ends up on this Mac. If they'd rather have less, offer the schema only, or a sample (that's when a sandbox fits).
+3. The local database: `create_local_database` named after the project, with the `instance_id` of a running local server of the same engine when there is one.
+4. `backup_database` on the source (keep the default format), then `restore_backup` with that `backup_id` and the new database's `connection_id`. Into an empty database it runs best-effort and reports what the local server couldn't create (`left_out`, `skipped`): tell the user. A big database may come back `running`; `list_backups` shows when it's done. For a different engine, use `migrate_database_check`, then `migrate_database`, instead.
+5. Point the project at it: `env_line` from `create_local_database` (or `get_connection_url`), in the project's gitignored env file, under the variable the project reads. If that file holds the production URL, say you're replacing it and keep the old line commented out, or put the local one in the file the framework reads for local overrides.
+6. The copy already has production's schema. Run the project's migrations only to bring it up to code that isn't deployed yet.
 
 ## The connection string of an existing local database
 
@@ -49,7 +61,7 @@ When the project needs to reach a local database TableStudio already knows (to f
 - `data: "sample"` copies up to `rows` rows per table. Best for checking a data fix against realistic rows.
 - `data: "fake"` generates rows.
 
-Run whatever you like against the sandbox's `connection_id`. The user discards it in one click; you can't delete it. Use `list_sandboxes` to reuse one you made earlier.
+Run whatever you like against the sandbox's `connection_id`. `remove_sandbox` deletes it when you're done (sandboxes only), and `list_sandboxes` finds one you made earlier. A sandbox isn't a project's local database: for that, see "A local copy of a remote or production database" above.
 
 ## PostgreSQL extensions
 

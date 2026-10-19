@@ -1,9 +1,16 @@
 name: CI
 
+# Work lands on staging. main is what users install (install.sh, the marketplaces, OpenCode's git
+# URL and the app's update check all read it), so it changes only through a pull request from
+# staging, and every merge to main is a release.
+
 on:
   push:
-    branches: [main]
+    branches: [main, staging]
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -23,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: ShellCheck
-        run: shellcheck -S error tablestudio/scripts/tablestudio-hook tests/run.sh install.sh
+        run: shellcheck -S error tablestudio/scripts/tablestudio-hook tests/run.sh install.sh scripts/version.sh
       - name: OpenCode plugin parses
         run: node --check tablestudio/opencode/index.js
       - name: JSON files parse
@@ -36,3 +43,44 @@ jobs:
                    tablestudio/opencode/package.json; do
             jq -e . "$f" > /dev/null || { echo "invalid JSON: $f"; exit 1; }
           done
+
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # tags
+      - name: Versions agree and have release notes
+        run: scripts/version.sh
+      - name: A pull request into main is a new version
+        if: github.event_name == 'pull_request' && github.base_ref == 'main'
+        run: |
+          v="$(scripts/version.sh)"
+          if git rev-parse -q --verify "refs/tags/v$v" > /dev/null; then
+            echo "::error::v$v is already released. On staging, run scripts/version.sh <next version> and write its CHANGELOG.md notes."
+            exit 1
+          fi
+
+  release:
+    # Tags the merge and publishes the version's CHANGELOG.md section as a GitHub release.
+    needs: [test, lint, version]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # tags
+      - name: Tag and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="$(scripts/version.sh)"
+          if git rev-parse -q --verify "refs/tags/v$v" > /dev/null; then
+            echo "::warning::main changed but v$v is already released, so agents won't be offered an update for this change."
+            exit 0
+          fi
+          scripts/version.sh --notes > "$RUNNER_TEMP/notes.md"
+          gh release create "v$v" --target "$GITHUB_SHA" --title "$v" --notes-file "$RUNNER_TEMP/notes.md"
