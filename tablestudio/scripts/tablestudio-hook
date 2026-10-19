@@ -481,7 +481,7 @@ session_start() {
     server_status "$port"
 
     note="## Database context (from the TableStudio plugin)
-TableStudio is the user's database app. Do this project's database work through its MCP tools rather than psql, mysql, sqlite3 or a one-off script: they reach the user's saved connections without credentials, dry-run writes against the real rows (preflight_statement), try changes on throwaway copies (create_sandbox), and send risky changes to the user's review inbox (stage_migration). For any task that reads or changes a database, follow the TableStudio database-workflow skill.
+TableStudio is the user's database app. Do this project's database work through its MCP tools rather than psql, mysql, sqlite3 or a one-off script: they reach the user's saved connections without credentials, dry-run writes against the real rows (preflight_statement), try changes on throwaway copies (create_sandbox), and send risky changes to the user's review inbox (stage_migration). get_schema gives the whole schema in one call, and er_diagram opens TableStudio's interactive ER diagram with a link to share (don't draw one). For any task that reads or changes a database, follow the TableStudio database-workflow skill.
 
 $(status_text "$port" "$dir")"
 

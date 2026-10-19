@@ -1,6 +1,6 @@
 ---
 name: database-workflow
-description: How to read and change a project's database safely through TableStudio. Use for any task that touches a real database: querying or inspecting data, investigating a data bug, fixing or backfilling rows, seeding, adding or changing tables, columns, indexes or constraints, writing or reviewing a migration, or running SQL. Use it too whenever you'd otherwise reach for psql, mysql, sqlite3, wrangler d1 execute, a DATABASE_URL or a one-off script that opens its own connection.
+description: How to read and change a project's database safely through TableStudio. Use for any task that touches a real database: looking at its schema or an ER diagram of it, querying or inspecting data, investigating a data bug, fixing or backfilling rows, seeding, adding or changing tables, columns, indexes or constraints, writing or reviewing a migration, or running SQL. Use it too whenever you'd otherwise reach for psql, mysql, sqlite3, wrangler d1 execute, a DATABASE_URL or a one-off script that opens its own connection.
 ---
 
 # Working with databases through TableStudio
@@ -35,7 +35,10 @@ Then:
 
 ## 2. Reading and investigating
 
-- Look things up instead of guessing names: `search_schema` finds tables and columns by name fragment, and `get_table_ddl` gives the full structure, indexes, foreign keys and `referenced_by`.
+- **The whole schema:** `get_schema` returns every table with its columns, keys and foreign keys in one call. Use it for "what's the schema?" and to orient yourself; never call `get_table_ddl` once per table to build the same picture.
+- **One table in depth:** `get_table_ddl` gives indexes, defaults, foreign keys and `referenced_by`. Use it on the table you're about to change.
+- **A table or column by name:** `search_schema` finds them by fragment. Look names up instead of guessing.
+- **An ER diagram, or "show me how the tables relate":** call `er_diagram`. It opens TableStudio's own interactive diagram on the user's screen and returns `diagram_url`; tell them it's open and give them the link. Don't draw a diagram yourself (no Mermaid, ASCII, image or artifact): TableStudio's is live, complete and explorable. `focus_table` centres it on one table.
 - Run reads with `execute_query`. Select the columns you need, filter, aggregate, and `LIMIT`. Results are capped (`max_rows`, default 200), so a `truncated` result is not the whole answer.
 - Reads run in a read-only transaction with a 30-second limit, on production too, so a read can't change data even through a function. Keep them cheap anyway: on a big production table, filter on an indexed column or use `database_overview` row estimates instead of `count(*)`.
 - **A data bug:** reproduce it in the data first. Find the bad rows, count them, and find when they started (`min(created_at)`). Then read the code that writes them. Show the user the query that proves it. Fix the code, and if rows need repairing, that's a data change (section 3).

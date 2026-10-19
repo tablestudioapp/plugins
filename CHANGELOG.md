@@ -8,6 +8,7 @@
 - **The Agent Center.** Each TableStudio call is reported with the conversation that made it, so TableStudio's new Agent Center shows activity by chat, links a staged change to the conversation that proposed it, and can reopen it. Needs the TableStudio update that adds the Agent Center.
 - **Reviews and revisions.** The skill tells the agent to share the `review_url` it gets from `stage_migration`, to read `review_feedback` when you ask for changes, and to revise in place with `update_staged_migration`.
 - **Safety the app enforces.** The skill now plans around `agent_writes` from `list_connections` (production and untagged remote databases take changes only through review) and knows that reads run read-only in the database. Needs the TableStudio update that adds them.
+- **Schemas and ER diagrams.** "What's the schema?" is one `get_schema` call instead of a `get_table_ddl` per table, and "show me an ER diagram" opens TableStudio's interactive diagram (`er_diagram`) with a link for the chat, instead of the agent drawing one. Needs the TableStudio update that adds both tools.
 - **Fewer false alarms.** The shell guard and the CLI reminder ignore text that's only searched, printed or written: a `grep` pattern, a `git commit` message, `find` without `-exec`.
 - **`mcp-stdio` bridge** for any MCP client that launches a command (Claude Desktop, VS Code, Windsurf, Zed, Gemini CLI).
 

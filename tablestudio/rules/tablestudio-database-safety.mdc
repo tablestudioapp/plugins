@@ -7,4 +7,5 @@ alwaysApply: true
 - Check a write with `preflight_statement` before running it. Connections with `agent_writes: review` in `list_connections` (production, and remote databases nobody tagged) take changes only through `stage_migration`; give the user the `review_url` it returns, and if they ask for changes, revise with `update_staged_migration`.
 - Never run write SQL, `pg_restore`, or a migration tool's deploy command against a production database from the terminal. If the user wants that, ask them to run it themselves.
 - When the repo has a migration tool (Prisma, Drizzle, Rails, Django, Alembic, …), make schema changes as migrations with that tool, not as hand-run `ALTER` statements.
+- For the schema, call `get_schema` once rather than `get_table_ddl` per table. When the user asks for an ER or schema diagram, call `er_diagram` (it opens TableStudio's interactive diagram and returns a link) instead of drawing one.
 - Never print, log or commit database passwords or connection strings.
