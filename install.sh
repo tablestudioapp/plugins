@@ -4,7 +4,7 @@
 #
 #   ./install.sh                     from a checkout of this repository
 #   ./install.sh cursor opencode     only these
-#   curl -fsSL https://raw.githubusercontent.com/tablestudioapp/plugins/main/install.sh | bash
+#   curl -fsSL https://tablestudio.sh/install | bash
 #
 # Run it again to update. It ends with a check of what's set up (also: ./install.sh --doctor).
 

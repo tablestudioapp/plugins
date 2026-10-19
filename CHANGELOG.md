@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.1
+
+- Every call carries the plugin's version, so TableStudio's Agent Center shows each agent's plugin version and offers an update only to the agents that need one.
+- After writing a Drizzle or Prisma migration file, agents give the user the link to it in TableStudio's Migrations window (`pending_repo_migrations` from `use_database`).
+- **`update_connection`.** Agents can rename a connection, file it under an existing project (`list_connections` now lists `projects`; a new one needs `create_project: true`), tag it, or make it read-only. Changes that let agents do the same or less happen at once. One that would let them do more (a production or remote database tagged development, a production tag removed, read-only off) becomes a permission request in TableStudio, which the user allows with Touch ID while the call waits. Agent access and the user's notes stay theirs.
+- **`add_connection`.** When a database the project uses isn't in TableStudio, agents add it from the project's settings: TableStudio reads the env file and its password itself, and saves the connection only if it connects. The session note and skill point to it instead of asking the user.
+- **A local copy of production** is a real local database, not a sandbox: the local-databases skill (the one agents load for "make me a local copy") now walks through it. Create the database on the local server that's already running (`create_local_database` with `instance_id`), back up production, restore into it (best-effort into an empty database, reporting what the local server couldn't create), and point the project's env file at it, keeping the production line commented out. It says first that a full copy puts production data on the Mac. Sandboxes are for experiments: capped per table, on TableStudio's sandbox server.
+- **Backups, restores and copies.** The skill covers TableStudio's new `backup_database`, `list_backups`, `restore_backup`, `migrate_database_check` and `migrate_database`: agents back up with the Backup window's options, and restore or copy a database themselves only into a sandbox or a database on this Mac they may write to, after a restore point. Anything else opens the Restore or Migrate window for the user to run.
+- **License.** From this version the plugin is under the [PolyForm Shield License 1.0.0](LICENSE) instead of MIT: use, change and share it for anything except a product that competes with TableStudio.
+
 ## 0.5.0
 
 - **A working database per chat.** Agents call `use_database` once they know which database the user means; later calls can leave `connection_id` out, and TableStudio's Agent Center shows each chat's working database. Without one, nothing defaults to production.

@@ -58,6 +58,18 @@ APP_BUNDLE_ID="sh.tablestudio"
 TAB="$(printf '\t')"
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
+# plugin_version — this copy's version, from whichever manifest it ships. Sent with every call so
+# TableStudio's Agent Center can say which agents run an outdated plugin.
+plugin_version() {
+    local root manifest
+    root="$(dirname "$(dirname "$SCRIPT_PATH")")"
+    for manifest in .claude-plugin/plugin.json .cursor-plugin/plugin.json .codex-plugin/plugin.json opencode/package.json; do
+        [ -f "$root/$manifest" ] || continue
+        sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$root/$manifest" | head -n 1
+        return 0
+    done
+}
+
 # ---------------------------------------------------------------------------------------------
 # Plumbing
 # ---------------------------------------------------------------------------------------------
@@ -515,7 +527,7 @@ This repo's database settings (credentials omitted):
 ${settings}"
         if [ "$SAVED_OK" = 1 ]; then
             note="${note}
-Call use_database with the id shown before anything else: after that, tools use it when you leave connection_id out. There's no need to match list_connections yourself. TableStudio's tools can't reach a setting marked \"not saved in TableStudio\": if the task needs it, ask the user to add it in TableStudio, and never ask for its password in chat."
+Call use_database with the id shown before anything else: after that, tools use it when you leave connection_id out. There's no need to match list_connections yourself. A setting marked \"not saved in TableStudio\" isn't reachable yet: if the task needs it, add it with add_connection (project_path set to this project, and env_var when there are several), which reads the password from the file itself. Never ask for a password in chat."
         else
             note="${note}
 To pick the connection_id, match these to list_connections: by project first, then by host, port and database."
@@ -1242,8 +1254,8 @@ mcp_headers() {
         echo "TableStudio's MCP token wasn't found. Open TableStudio and turn on Settings → MCP." >&2
         return 1
     fi
-    printf '{"Authorization":"Bearer %s","X-TableStudio-Client":"%s","X-TableStudio-Project":"%s"}\n' \
-        "$token" "$(client_id)" "$(json_escape "$PWD")"
+    printf '{"Authorization":"Bearer %s","X-TableStudio-Client":"%s","X-TableStudio-Project":"%s","X-TableStudio-Plugin":"%s"}\n' \
+        "$token" "$(client_id)" "$(json_escape "$PWD")" "$(plugin_version)"
 }
 
 # connect-cursor: Cursor can't take a token from a plugin, so open its own one-click install link
@@ -1319,7 +1331,7 @@ forward_mcp() {
     } | curl -s -o "$5/body" -D "$5/headers" -w '%{http_code}' --max-time 900 -K - \
         -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
         -H "X-TableStudio-Client: $(client_id)" -H "X-TableStudio-Bridge: $4" \
-        -H "X-TableStudio-Project: $project" \
+        -H "X-TableStudio-Project: $project" -H "X-TableStudio-Plugin: $(plugin_version)" \
         --data-binary "@$5/request" "http://127.0.0.1:${1}/" 2>/dev/null || true
 }
 

@@ -13,7 +13,7 @@ The tool names below are TableStudio's. Your client may show them with a prefix 
 
 The session's **Database context** note, from the TableStudio plugin, usually names the TableStudio connection behind each of the repo's database settings, with its id and environment. Call `use_database` with that id first: it makes it this chat's working database, so later calls can leave `connection_id` out, and it returns what you need to start (environment, `agent_access`, whether the server is running, the tables with row estimates, and links). The note also says when TableStudio's tools aren't available and what the user should do about it.
 
-Without a project database, nothing is chosen for you, and a production database is never picked by default. When the user names a database, `use_database` it. Pass `connection_id` explicitly for a one-off call to another database; call `use_database` again to switch.
+Without a project database, nothing is chosen for you, and a production database is never picked by default. When the user names a database ("my todo-app database", "the analytics one"), it's almost always one of their TableStudio connections, even when it isn't this repo's: find it with `list_connections` rather than searching the repo for a file. `use_database` it when the chat is about it; pass `connection_id` explicitly for a one-off call to another database, and call `use_database` again to switch.
 
 Without the note, or for a database it doesn't name:
 
@@ -34,7 +34,8 @@ Then:
 - Call `describe_capabilities` once before planning anything beyond a read. It says whether direct writes, staging and sandboxes are allowed right now, and names the setting behind each. Plan around it rather than finding a limit by being refused.
 - `agent_writes: review` (production, or remote and untagged) means never write to it directly: stage changes for review. TableStudio refuses a direct write there anyway, so plan for staging from the start.
 - Check `engine` (postgres, mysql, sqlite, d1, clickhouse) before writing SQL, and write that dialect.
-- A database that isn't saved in TableStudio can't be reached through its tools. Ask the user to add it in TableStudio. Never ask for a password in chat.
+- A database that isn't saved in TableStudio: add it with `add_connection`, passing the project folder as `project_path` (plus `env_file` and `env_var` when it lists several). TableStudio reads the settings and the password from the file itself, and saves the connection only if it connects. Don't copy a password out of a file into `connection_string`: pass the project instead. Never ask for a password in chat. A remote database you add is saved untagged (or `production` if you say so); only the user marks one development or staging.
+- To tidy a saved connection, `update_connection`: rename it, file it under a project (pick one from `list_connections`' `projects`; `create_project: true` only for a genuinely new one), tag it, or make it read-only. Changes that let agents do the same or less happen at once (tagging production, filing, renaming, read-only on). One that would let agents do more (a production or remote database tagged development or staging, a production tag removed, read-only off) is asked of the user in TableStudio, who allows it with Touch ID, and the call waits for the answer: `updated`, `denied` (leave it and don't ask again), or `waiting_for_user` (tell them it's waiting in TableStudio; calling again with the same change checks without asking twice). Only ask for what the user asked you to do. Agent access and the user's notes are theirs alone.
 - If a call fails because the database is unreachable, call `connection_status`. When it says a local server is stopped, call `start_local_database` with the `instance_id` it gives you.
 
 **One call, not one per thing.** The tools take lists. Use them instead of calling a tool once per table, database, word or query:
@@ -76,13 +77,13 @@ On **PostgreSQL**:
 
 On **other engines** there's no dry run: first run a `SELECT count(*)` with the same `WHERE`, report the count, then follow the same execute-or-stage rule.
 
-Before anything destructive on a database that matters (a large DELETE, a DROP, a TRUNCATE), call `create_restore_point` when sandboxes are enabled, and tell the user you did.
+Before anything destructive on a database that matters (a large DELETE, a DROP, a TRUNCATE), call `create_restore_point` when sandboxes are enabled, and tell the user you did. `restore_backup` with its `restore_point_id` puts the database back (see section 6).
 
 ## 4. Changing the schema
 
 **If the repo uses a migration tool** (Prisma, Drizzle, Rails, Django, Alembic, Laravel, Supabase, Knex, Ecto, TypeORM, Wrangler D1, or plain numbered SQL files; the session context names it when the plugin detected one), the change belongs in that tool:
 
-1. Make the change the tool's way: edit the schema and generate a migration, or write the migration file.
+1. Make the change the tool's way: edit the schema and generate a migration, or write the migration file. When TableStudio watches the project's migrations, the file shows up as pending in its Migrations window, where the user applies it with the project's CLI: `use_database` lists it under `pending_repo_migrations`, with the link to give the user.
 2. Apply it to the **local development** database with the tool's dev command. For plain numbered SQL files with no runner, run the file's SQL on the local development database with `execute_query` (`statements` keeps it one transaction), and say you did.
 3. Check it against real data (below).
 4. Leave applying it anywhere else to the user's normal deploy process. Never run the tool's deploy command against production yourself.
@@ -128,7 +129,15 @@ Tell the user what you checked and what you found ("`orders.status` has 0 NULLs 
 
 When the user asks what's waiting for them ("what did you stage?", "did my migration run?"), call `list_staged_migrations` for this repo's connections. Report the **pending** ones first, newest first: the title, the connection, when it was staged, its `review_url`, and one line on what it does and how risky it is (does it lock or rewrite a large table, delete data, or lack a `WHERE`?). Then any with **changes requested**, with the user's note, and any that **failed**, with the error. Say plainly that the user applies, sends back or ignores them in TableStudio's Agent Center; you can't apply them yourself.
 
-## 6. Links to give the user
+## 6. Backups, restores and copies
+
+- **Back up** with `backup_database` when the user asks for a backup, or wants a file before a big change: the whole database by default, or `contents: "schema"` or `"data"`, `tables`, `schemas`, and on PostgreSQL a `format` (keep the default `custom`: it's the one `restore_backup` restores). It only reads the database. The file goes to the user's backups folder and shows in TableStudio's Backup window. For a quick undo point before a risky change, `create_restore_point` is lighter.
+- **Restore** with `restore_backup` only when the user asks: a `backup_id` from `list_backups`, a backup `file`, or a `restore_point_id` from `list_restore_points`. It replaces data, so TableStudio runs it only into a sandbox or a database on this Mac you may write to, after saving a restore point of it. Anywhere else it opens TableStudio's Restore window, filled in, and returns `status: handed_to_user` with a `link`: tell the user it's waiting for them there. Never say it ran.
+- **Copy one database into another**, same engine or across engines: first `migrate_database_check`, the pre-check, which changes nothing. Show the user its blockers, warnings and estimate. Only once they want it, `migrate_database`, adding `acknowledge_warnings: true` if the check had warnings. It runs or opens the Migrate window by the same rule as a restore. Indexes beyond primary keys, triggers and check constraints aren't copied: offer to recreate the ones the target needs.
+- **A local copy of production** to develop against: a real local database (`create_local_database`, with the `instance_id` of a running local server of that engine when there is one), then `backup_database` on production and `restore_backup` into it. Not `create_sandbox`, which is a capped throwaway copy for experiments. The local-databases skill has the steps, including what to tell the user first.
+- A backup, restore or copy still going after 45 seconds returns `status: running`. It carries on in TableStudio; `list_backups` shows how it ended.
+
+## 7. Links to give the user
 
 TableStudio returns `tablestudio://` links that open the right place in the app. Give them to the user as clickable links whenever they'd help, rather than describing where to click:
 
@@ -140,13 +149,17 @@ TableStudio returns `tablestudio://` links that open the right place in the app.
 | `app_url` (get_table_ddl, create_sandbox) | That table, or the sandbox, in TableStudio |
 | `links` (use_database) | The database, its diagram, and this chat's activity |
 | `this_chat_activity` (list_connections, use_database, stage_migration) | Everything this chat did, in the Agent Center |
+| `repo_migrations` (use_database) | The project's pending Drizzle or Prisma migration files, in the Migrations window |
+| `link` (restore_backup, migrate_database, when handed to the user) | The Restore or Migrate window, filled in for the user to run |
 
-## 7. When TableStudio says no
+## 8. When TableStudio says no
 
 - A refusal that names a setting (for example, writes are off) is the user's choice. Tell them which setting would allow it, offer to stage the change instead, and stop. Don't route around it.
 - If TableStudio's tools aren't available at all, the session note says why: the app is closed, its MCP server is off (Settings → MCP), or the client isn't connected to it yet. Pass on the fix it gives. In Claude Code, the user can reconnect with `/mcp` once TableStudio is open.
 - A refusal with `blocked: production_review_required` or `review_required` means that connection only takes changes through review: stage it. `dry_run_required` means run `preflight_statement` first and pass `expected_rows`. `side_effect_function` means the statement calls something that acts outside a transaction; show the user the SQL instead.
 - `agent_access_structure` or `agent_access_read` is the user's limit for that database: say what it allows, offer what fits (the schema, or a staged change), and don't look for another way to the data. `write_in_read_query` means use `execute_query` for that write. `rate_limited` means slow down: use the list forms instead of one call per item.
+- `user_denied` means the user turned the request down in TableStudio: leave it as it is, and don't ask again unless they bring it up.
+- `restore_point_failed` on a restore or copy means TableStudio couldn't save the restore point it takes first, so nothing ran: tell the user why. `migration_blockers` and `warnings_not_acknowledged` mean show the user the pre-check before anything else.
 - A local database whose server is stopped fails at once with the `instance_id` to pass to `start_local_database`. Start it only if the user wants to work on it.
 - The plugin's shell guard blocks shell commands that write to production. Treat a block as a signal to use the steps above, not as something to work around.
 - Everything you do through TableStudio is shown to the user in its Agent Center, grouped by this conversation.
