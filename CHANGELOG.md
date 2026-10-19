@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.1
+
+- The skill, Cursor rule and session note use TableStudio's `get_schema` and `er_diagram` (below), so a schema question is one call and an ER diagram is TableStudio's own, with a link.
+
 ## 0.4.0
 
 - **OpenCode.** One plugin entry gives OpenCode everything the other clients get: TableStudio's MCP server (no token to copy), the skills, the database note in the system prompt, and the shell guard as OpenCode permission rules, so a remote write gets OpenCode's own approval prompt and a production write is denied. Install with `opencode plugin add git+https://github.com/tablestudioapp/plugins.git` or `./install.sh opencode`.

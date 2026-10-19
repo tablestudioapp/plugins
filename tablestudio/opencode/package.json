@@ -1,6 +1,6 @@
 {
   "name": "opencode-tablestudio",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "TableStudio for OpenCode: safe database work through the TableStudio app.",
   "type": "module",
   "main": "./index.js",
