@@ -1,6 +1,6 @@
 {
   "name": "opencode-tablestudio",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "TableStudio for OpenCode: your agent works on your databases through the TableStudio app, with read-only checks, dry runs and a review inbox for risky changes.",
   "type": "module",
   "main": "./tablestudio/opencode/index.js",

@@ -237,16 +237,24 @@ SAVED_CONNECTIONS_JS='function run(argv) {
   }
   var connections = blob("postgres_connections");
   if (!Array.isArray(connections)) return "#unavailable";
+  // Connections the user turned agent access off for are left out entirely: agents never learn
+  // they exist. The level is the 12th field.
+  var access = {};
+  try {
+    var levels = src ? $.NSDictionary.dictionaryWithContentsOfFile(src).objectForKey("agentAccessLevels")
+                     : $.NSUserDefaults.alloc.initWithSuiteName("sh.tablestudio").dictionaryForKey("agentAccessLevels");
+    if (levels && !levels.isNil()) access = ObjC.deepUnwrap(levels) || {};
+  } catch (e) {}
   var projects = {};
   (blob("postgres_projects") || []).forEach(function (p) { if (p && p.id) projects[p.id] = p.name; });
   function field(v) {
     v = (v === undefined || v === null) ? "" : String(v).replace(/[\t\r\n]+/g, " ").trim();
     return v === "" ? "-" : v;
   }
-  return connections.filter(function (c) { return c && c.id && !c.isSandbox; }).map(function (c) {
+  return connections.filter(function (c) { return c && c.id && !c.isSandbox && access[c.id] !== "off"; }).map(function (c) {
     return [c.id, c.name, c.kind, c.host, c.port, c.database, c.environment,
             projects[c.projectID] || c.projectName, c.readOnly ? "yes" : "no", c.filePath,
-            c.d1DatabaseID].map(field).join("\t");
+            c.d1DatabaseID, access[c.id]].map(field).join("\t");
   }).join("\n");
 }'
 
@@ -292,7 +300,7 @@ saved_matches() {
     local engine="$1" host port="$3" db="$4" id name kind shost sport sdb env project ro file d1
     host="$(norm_host "$2")"
     [ -n "$port" ] || port="$(default_port "$engine")"
-    while IFS="$TAB" read -r id name kind shost sport sdb env project ro file d1; do
+    while IFS="$TAB" read -r id name kind shost sport sdb env project ro file d1 _access; do
         [ -n "$id" ] && [ "$kind" = "$engine" ] || continue
         [ "$shost" = "-" ] && shost=""
         [ "$(norm_host "$shost")" = "$host" ] || continue
@@ -309,7 +317,7 @@ EOF
 # name, 11: D1 database id) is the value, in the same shape as saved_matches.
 saved_where() {
     local column="$1" want="$2" engine="$3" id name kind shost sport sdb env project ro file d1 have
-    while IFS="$TAB" read -r id name kind shost sport sdb env project ro file d1; do
+    while IFS="$TAB" read -r id name kind shost sport sdb env project ro file d1 _access; do
         [ -n "$id" ] && [ "$kind" = "$engine" ] || continue
         if [ "$column" = 10 ]; then have="${file##*/}"; else have="$d1"; fi
         [ "$have" = "$want" ] || continue
@@ -473,15 +481,30 @@ session_start() {
     compose="$(describe_compose_databases "$dir")"
     project="$(describe_project_connections "$dir" "$settings")"
 
-    # Nothing database-shaped here: stay silent rather than add noise to every session.
-    [ -n "$settings$tooling$compose$project" ] || return 0
-
     local port note
     port="$(plugin_port)"
+
+    # Nothing database-shaped in this folder: a short map instead, so the agent knows what the
+    # user has and that this chat isn't tied to a database yet.
+    if [ -z "$settings$tooling$compose$project" ]; then
+        [ "$SAVED_OK" = 1 ] || return 0
+        server_status "$port"
+        note="## Database context (from the TableStudio plugin)
+TableStudio is the user's database app; use its MCP tools for database work (they need no credentials, and every read is read-only in the database). This folder doesn't configure a database, so this chat isn't tied to one yet. When the user says which database they mean, call use_database with it: later calls can then leave connection_id out. Never pick a production database unless the user names it.
+
+$(status_text "$port" "$dir")
+
+$(describe_all_connections)
+
+Start with: list_connections (what exists, what's running), use_database (choose), get_schema (whole schema in one call), read_query (reads), preflight_statement then execute_query (writes), stage_migration (changes the user reviews). The tools take lists, so never call one once per table or database. For any database task, follow the TableStudio database-workflow skill."
+        emit_context "$note"
+        return 0
+    fi
+
     server_status "$port"
 
     note="## Database context (from the TableStudio plugin)
-TableStudio is the user's database app. Do this project's database work through its MCP tools rather than psql, mysql, sqlite3 or a one-off script: they reach the user's saved connections without credentials, dry-run writes against the real rows (preflight_statement), try changes on throwaway copies (create_sandbox), and send risky changes to the user's review inbox (stage_migration). get_schema gives the whole schema in one call, and er_diagram opens TableStudio's interactive ER diagram with a link to share (don't draw one). For any task that reads or changes a database, follow the TableStudio database-workflow skill.
+TableStudio is the user's database app. Do this project's database work through its MCP tools rather than psql, mysql, sqlite3 or a one-off script: they reach the user's saved connections without credentials, dry-run writes against the real rows (preflight_statement), try changes on throwaway copies (create_sandbox), and send risky changes to the user's review inbox (stage_migration). get_schema gives the whole schema in one call, and er_diagram opens TableStudio's interactive ER diagram with a link to share (don't draw one). The tools take lists (get_table_ddl tables, execute_query queries, database_health connection_ids), so never call one once per table or database. For any task that reads or changes a database, follow the TableStudio database-workflow skill.
 
 $(status_text "$port" "$dir")"
 
@@ -492,7 +515,7 @@ This repo's database settings (credentials omitted):
 ${settings}"
         if [ "$SAVED_OK" = 1 ]; then
             note="${note}
-Pass the id shown as connection_id; there's no need to match list_connections yourself. TableStudio's tools can't reach a setting marked \"not saved in TableStudio\": if the task needs it, ask the user to add it in TableStudio, and never ask for its password in chat."
+Call use_database with the id shown before anything else: after that, tools use it when you leave connection_id out. There's no need to match list_connections yourself. TableStudio's tools can't reach a setting marked \"not saved in TableStudio\": if the task needs it, ask the user to add it in TableStudio, and never ask for its password in chat."
         else
             note="${note}
 To pick the connection_id, match these to list_connections: by project first, then by host, port and database."
@@ -632,7 +655,7 @@ describe_project_connections() {
     [ "$SAVED_OK" = 1 ] || return 0
     want="$(squash "$(basename "$dir")")"
     [ -n "$want" ] || return 0
-    while IFS="$TAB" read -r id name kind shost sport sdb env project ro file d1; do
+    while IFS="$TAB" read -r id name kind shost sport sdb env project ro file d1 _access; do
         [ -n "$id" ] && [ "$project" != "-" ] || continue
         [ "$(squash "$project")" = "$want" ] || continue
         case "$listed" in *"$id"*) continue ;; esac
@@ -644,6 +667,33 @@ describe_project_connections() {
         [ "$env" = "-" ] || where="$where, $env"
         [ "$ro" = yes ] && where="$where, read-only"
         printf -- '- "%s" (id %s, %s)\n' "$name" "$id" "$where"
+        count=$((count + 1))
+    done <<EOF
+$SAVED
+EOF
+}
+
+# describe_all_connections — up to 15 saved connections, one line each, production marked.
+describe_all_connections() {
+    local id name kind shost sport sdb env project ro file d1 access count=0 total where
+    total="$(printf '%s\n' "$SAVED" | grep -c .)"
+    [ "$total" -gt 0 ] || { printf 'TableStudio has no saved connections yet.'; return 0; }
+    printf 'TableStudio has %s saved database%s:\n' "$total" "$([ "$total" = 1 ] || echo s)"
+    while IFS="$TAB" read -r id name kind shost sport sdb env project ro file d1 access; do
+        [ -n "$id" ] || continue
+        [ "$count" -lt 15 ] || { printf -- '- … and %s more (list_connections has them all)\n' "$((total - 15))"; break; }
+        where="$kind"
+        case "$kind" in
+            sqlite) where="$where, local file" ;;
+            d1) where="$where, remote" ;;
+            *) case "$shost" in localhost | 127.* | ::1 | 0.0.0.0 | -) where="$where, local" ;; *) where="$where, remote" ;; esac ;;
+        esac
+        if [ "$env" = production ]; then where="$where, PRODUCTION: only when the user names it"
+        elif [ "$env" != "-" ]; then where="$where, $env"
+        else case "$where" in *remote*) where="$where, untagged: treat as production" ;; esac
+        fi
+        case "$access" in structure) where="$where, agents see structure only" ;; read) where="$where, read-only for agents" ;; esac
+        printf -- '- "%s" (%s)\n' "$name" "$where"
         count=$((count + 1))
     done <<EOF
 $SAVED
@@ -1314,12 +1364,19 @@ agent_event() {
     else
         printf '{"client":"%s","hook":%s}' "$(client_id)" "$INPUT" >"$file"
     fi
-    (
+    post_event() {
         printf 'header = "Authorization: Bearer %s"\n' "$token" |
-            curl -s -o /dev/null --max-time 3 -K - -H 'Content-Type: application/json' \
+            curl -s -o /dev/null --max-time "$1" -K - -H 'Content-Type: application/json' \
                 --data-binary "@$file" "http://127.0.0.1:${port}/agent/events" 2>/dev/null
         rm -f "$file"
-    ) >/dev/null 2>&1 </dev/null &
+    }
+    # A report sent before the call (PreToolUse, OpenCode's before-hook) is awaited, briefly: then
+    # TableStudio knows the conversation while the call runs, for its chosen database and links.
+    # An after-the-fact report (Cursor's afterMCPExecution) needn't hold anything up.
+    case "$(json_get hook_event_name)" in
+        PreToolUse | before | beforeMCPExecution) post_event 2 >/dev/null 2>&1 </dev/null ;;
+        *) (post_event 3) >/dev/null 2>&1 </dev/null & ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1385,8 +1442,12 @@ install_claude() {
     else
         claude plugin marketplace add "$KIT_ROOT" >/dev/null 2>&1 || { no "couldn't add the marketplace"; return; }
     fi
-    if claude plugin install tablestudio@tablestudio >/dev/null 2>&1; then
-        ok "plugin installed: skills, hooks, and TableStudio's MCP server with no token to copy"
+    # For every project (user scope). An install made from inside one repo can end up enabled
+    # for that repo only, which leaves every other project without TableStudio.
+    if claude plugin install tablestudio@tablestudio --scope user >/dev/null 2>&1 ||
+        claude plugin enable tablestudio@tablestudio --scope user >/dev/null 2>&1; then
+        claude plugin enable tablestudio@tablestudio --scope user >/dev/null 2>&1
+        ok "plugin installed for every project: skills, hooks, and TableStudio's MCP server with no token to copy"
         todo "in a running Claude Code session: /reload-plugins (new sessions pick it up on their own)"
     else
         no "couldn't install the plugin"
@@ -1486,7 +1547,9 @@ doctor() {
     say ""
     say "Agents"
     if command -v claude >/dev/null 2>&1; then
-        if claude plugin list 2>/dev/null | grep -q 'tablestudio'; then ok "Claude Code: plugin installed"
+        # Listed from the home folder, so an install enabled for one repo only doesn't count.
+        if (cd "$HOME" && claude plugin list 2>/dev/null) | grep -A4 'tablestudio@' | grep -q 'enabled'; then ok "Claude Code: plugin installed"
+        elif claude plugin list 2>/dev/null | grep -q 'tablestudio'; then no "Claude Code: plugin installed for one project only"; todo "./install.sh claude (installs it for every project)"
         else no "Claude Code: plugin not installed"; todo "$KIT_ROOT/install.sh claude"; fi
         claude_has_manual_server "$port" "$PWD" && todo "Claude Code also has a hand-added entry; remove it: claude mcp remove tablestudio"
     else
@@ -1500,7 +1563,14 @@ doctor() {
         no "Cursor: not on this Mac"
     fi
     if command -v codex >/dev/null 2>&1; then
-        if codex plugin list 2>/dev/null | grep 'tablestudio@tablestudio' | grep -vq 'not installed'; then ok "Codex: plugin installed (trust its hooks with /hooks)"
+        if codex plugin list 2>/dev/null | grep 'tablestudio@tablestudio' | grep -vq 'not installed'; then
+            # Codex runs a plugin's hooks only once the user trusts them in /hooks, and records each
+            # one in config.toml. Without them there's no session note and no chat attribution.
+            local wanted trusted
+            wanted="$(grep -o '"command": *"' "$KIT_PLUGIN/hooks/codex-hooks.json" 2>/dev/null | wc -l | tr -d ' ')"
+            trusted="$(grep -c 'hooks.state."tablestudio@tablestudio:' "${CODEX_HOME:-$HOME/.codex}/config.toml" 2>/dev/null || true)"
+            if [ "${trusted:-0}" -ge "${wanted:-1}" ]; then ok "Codex: plugin installed, hooks trusted"
+            else ok "Codex: plugin installed"; todo "in Codex: run /hooks and trust TableStudio's hooks (${trusted:-0} of ${wanted:-?} trusted)"; fi
         else no "Codex: plugin not installed"; todo "$KIT_ROOT/install.sh codex"; fi
         codex_has_manual_server "$port" && todo "Codex also has a hand-added [mcp_servers] entry in ~/.codex/config.toml; remove it"
     else

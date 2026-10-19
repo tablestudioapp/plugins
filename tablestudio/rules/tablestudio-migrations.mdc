@@ -6,7 +6,7 @@ alwaysApply: false
 
 A migration that passes on the local database can still fail, or lock the app, where the real rows are. Before you call one done, check it read-only against the database it will deploy to, with TableStudio's tools (the `database-workflow` skill, "Check a migration against real data"):
 
-- `get_table_ddl` for each table it alters: rows, indexes, and what references it.
+- `get_table_ddl` with `tables` set to every table it alters, in one call: row estimates, indexes, and what references them.
 - For each constraint it adds (NOT NULL, UNIQUE, a foreign key, a CHECK or a narrower type), `execute_query` the SELECT that finds rows breaking it. Any rows means the deploy would fail: add a backfill or cleanup step first.
 - On PostgreSQL, flag steps that rewrite or lock a big table (type changes, volatile defaults, `CREATE INDEX` without `CONCURRENTLY`) and use the safe pattern.
 - If it's risky, run it on a copy: `create_sandbox` from that connection (`data: "sample"`), execute the migration there, then `compare_schemas`.

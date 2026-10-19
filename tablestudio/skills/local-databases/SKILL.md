@@ -12,8 +12,9 @@ TableStudio manages database servers on this Mac, including ones it adopted from
 1. `connection_status` (no arguments reports every connection). It runs no query, so it works while the database is down, and it tells you whether a local server backs the connection and whether that server is running.
 2. If the server is stopped, call `start_local_database` with the `instance_id` it returned. It's safe to call when the server is already running.
 3. If the port is taken by something else, the error names the occupant. Tell the user rather than killing processes.
+4. If it still won't start, `search_server_log` with its `instance_id` (and a pattern like `FATAL`) shows why, without reading the log file yourself.
 
-`list_local_databases` shows everything local: managed servers, adopted ones, SQLite files, and servers TableStudio doesn't manage that hold a port. Note the two ids: `instance_id` is the server (start and stop take it), and `connection_id` is the database you query. They aren't interchangeable.
+`list_connections` already says, for each local database, whether its server is running (`local_server.running`) and which other saved databases share that server. `list_local_databases` adds what has no saved connection: adopted servers, SQLite files, and servers TableStudio doesn't manage that hold a port. Note the two ids: `instance_id` is the server (start and stop take it), and `connection_id` is the database you query. They aren't interchangeable, and a server holding several databases lists each one's `connection_id` under `connections`.
 
 ## A new database
 

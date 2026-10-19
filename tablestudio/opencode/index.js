@@ -98,7 +98,19 @@ function readSkills() {
 /** The first piece of text in a prompt, whatever shape OpenCode gives it: the conversation's title. */
 function promptText(value, depth = 0) {
   if (depth > 6 || value == null) return undefined
-  if (typeof value === "string") return value.trim() || undefined
+  if (typeof value === "string") {
+    let text = value.trim()
+    // Some OpenCode versions hand over the prompt JSON-encoded: "\"text\"".
+    if (text.startsWith('"')) {
+      try {
+        const parsed = JSON.parse(text)
+        if (typeof parsed === "string") text = parsed.trim()
+      } catch {
+        text = text.replace(/^"+|"+$/g, "").trim()
+      }
+    }
+    return text || undefined
+  }
   if (Array.isArray(value)) {
     for (const item of value) {
       const text = promptText(item, depth + 1)
@@ -107,7 +119,7 @@ function promptText(value, depth = 0) {
     return undefined
   }
   if (typeof value === "object") {
-    if (typeof value.text === "string" && value.text.trim()) return value.text.trim()
+    if (typeof value.text === "string" && value.text.trim()) return promptText(value.text, depth + 1)
     for (const key of ["parts", "content", "prompt", "input"]) {
       const text = promptText(value[key], depth + 1)
       if (text) return text
@@ -163,6 +175,8 @@ export default {
       if (titles.has(prompt.sessionID)) return
       const text = promptText(prompt.prompt)
       if (text) titles.set(prompt.sessionID, text.split("\n")[0].slice(0, 120))
+      // One entry per conversation this OpenCode has seen; the oldest go first.
+      while (titles.size > 200) titles.delete(titles.keys().next().value)
     })))
     await register("context", ctx.session.hook("context", guarded("context", async (request) => {
       const text = await note
@@ -194,9 +208,28 @@ export default {
       }
     })))
 
+    // Which conversation is making a TableStudio call, reported before it runs and awaited, so
+    // TableStudio knows the chat while the call is in flight: its chosen database (use_database)
+    // and the link to its activity. The after-hook below covers versions without this one.
+    const reportedBefore = new Set()
+    await register("tools-before", ctx.tool.hook("execute.before", guarded("tools-before", async (call) => {
+      if (!/tablestudio/i.test(call.tool ?? "")) return
+      await runHook(["agent-event", "opencode"], {
+        hook_event_name: "before",
+        session_id: call.sessionID,
+        tool_name: call.tool,
+        tool_input: call.input,
+        title: titles.get(call.sessionID),
+        cwd: directory,
+      }, directory, 3000)
+      if (call.id) reportedBefore.add(call.id)
+      if (reportedBefore.size > 500) reportedBefore.delete(reportedBefore.values().next().value)
+    })))
+
     await register("tools", ctx.tool.hook("execute.after", guarded("tools", async (call) => {
       // Which conversation made this TableStudio call — for the Agent Center. Not awaited.
       if (/tablestudio/i.test(call.tool)) {
+        if (call.id && reportedBefore.delete(call.id)) return
         void runHook(["agent-event", "opencode"], {
           session_id: call.sessionID,
           tool_use_id: call.id,

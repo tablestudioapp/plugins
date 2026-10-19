@@ -15,15 +15,18 @@ Pick the connection first, as described in the database-workflow skill. Prefer r
 - **"Why is the database slow?"** Call `slow_queries`. It ranks statements by total time from `pg_stat_statements`. Keep each row's `query_id`; the other tools accept it. If the extension isn't installed, the tool explains what enabling it involves, so pass that on rather than installing it unasked.
 - **Broad tuning:** `workload_index_advisor` finds the fewest indexes that cover the most database time, and lists existing indexes that are never used.
 
+## What's running right now
+
+"Why is it slow right now?" or "what's holding the lock?": `active_queries` lists each session's query, how long it has run, what it waits on and which pids block it (`min_seconds` to filter). On a development or local database, `cancel_query` stops one by pid (its transaction rolls back; `terminate: true` ends the session). On production it's refused: tell the user the pid and the query.
+
 ## A health check
 
-When the user asks what's wrong with a database, or wants a general review, change nothing and report:
+When the user asks what's wrong with a database, or wants a general review, change nothing and make **one** call: `database_health` with `include: ["overview", "schema_issues"]`. That's the health findings, the size, biggest tables and connection counts, and the database-wide design scan together.
 
-1. `database_health`. Read its `unavailable` list before summarizing: an empty findings list with entries there means checks were skipped, not that everything is fine.
-2. `database_overview` for size, the biggest and busiest tables, and connection counts.
-3. `schema_issues` (no `table`) for design problems across the database.
+- **Several databases** ("check my local databases"): add `connection_ids: [...]`, or `scope: "local"` for every database on this Mac. Server settings every database shares are reported once under `servers`; stopped local servers are listed under `skipped` (say so, don't call them healthy). With several databases each section is summarized, so for `verify_sql` and fixes on the one that matters, call `database_health` again with just its `connection_id`.
+- Read each `unavailable` list before summarizing: an empty findings list with entries there means checks were skipped, not that everything is fine.
 
-Put the findings that matter most first, in plain language: what's wrong, what it costs if ignored, and the fix. Include each finding's `verify_sql` so the user can check the number, and any fix's `lock_impact`. Offer to put the fixes the user picks through "Ship it" below.
+Put the findings that matter most first, in plain language: what's wrong, what it costs if ignored, and the fix. For the findings you lead with, include `verify_sql` so the user can check the number, and any fix's `lock_impact`. A single-database result has them; a several-database summary doesn't, so for those call `database_health` with that one `connection_id` first. Offer to put the fixes the user picks through "Ship it" below.
 
 ## Diagnose one statement
 

@@ -11,7 +11,9 @@ The tool names below are TableStudio's. Your client may show them with a prefix 
 
 ## 1. Find the right database before doing anything
 
-The session's **Database context** note, from the TableStudio plugin, usually names the TableStudio connection behind each of the repo's database settings, with its id and environment. Use that id as `connection_id`. The note also says when TableStudio's tools aren't available and what the user should do about it.
+The session's **Database context** note, from the TableStudio plugin, usually names the TableStudio connection behind each of the repo's database settings, with its id and environment. Call `use_database` with that id first: it makes it this chat's working database, so later calls can leave `connection_id` out, and it returns what you need to start (environment, `agent_access`, whether the server is running, the tables with row estimates, and links). The note also says when TableStudio's tools aren't available and what the user should do about it.
+
+Without a project database, nothing is chosen for you, and a production database is never picked by default. When the user names a database, `use_database` it. Pass `connection_id` explicitly for a one-off call to another database; call `use_database` again to switch.
 
 Without the note, or for a database it doesn't name:
 
@@ -22,6 +24,8 @@ Without the note, or for a database it doesn't name:
    - `location`: `local` (this Mac), `remote`, or `sandbox` (a throwaway copy, safe to experiment on).
    - `agent_writes`: `direct` means execute_query may write there (when writes are on); `review` means every change goes through `stage_migration` for the user to apply. TableStudio decides this, not you: production, and any remote database the user hasn't tagged development or staging, are `review`.
    - `notes`: the user's notes on the database's conventions (soft deletes, money in cents, naming). Follow them.
+   - `agent_access`: what the user lets agents do there. `structure`: schema, plans and counts, never row values. `read`: reads only; every change goes to review. `read_write`: writes follow `agent_writes`. A database set to Off isn't listed at all; don't go looking for it.
+   - `local_server`: for a database on this Mac, its server, whether that server is `running`, and `shared_with` (the other saved databases on the same server). The list starts with summary counts, so "what databases do I have, and which are running?" is this one call: don't add `connection_status` or `list_local_databases` to answer it.
 2. Match the project first, then confirm with `host`, `port` and `database` against the project's own settings (`.env`, config).
 3. If two connections could be the one the user means, or you can't tell whether one is production, **ask**. Don't guess.
 
@@ -33,13 +37,28 @@ Then:
 - A database that isn't saved in TableStudio can't be reached through its tools. Ask the user to add it in TableStudio. Never ask for a password in chat.
 - If a call fails because the database is unreachable, call `connection_status`. When it says a local server is stopped, call `start_local_database` with the `instance_id` it gives you.
 
+**One call, not one per thing.** The tools take lists. Use them instead of calling a tool once per table, database, word or query:
+
+| Instead of | Call |
+|---|---|
+| `get_table_ddl` once per table | `get_table_ddl` with `tables: [...]` (and `row_counts: "exact"` for exact counts) |
+| a hand-written `count(*)` or size query for every table | `list_tables` with `exact_counts: true` (it has sizes too), or `get_schema` with `row_counts: "exact"` |
+| `cancel_query` once per pid | `cancel_query` with `pids: [...]`, or `min_seconds` for every query over that age |
+| `search_schema` once per word | `search_schema` with `patterns: [...]` |
+| several separate SELECTs | `read_query` with `queries: [...]` (up to 10) |
+| one write per call for a multi-step change | `execute_query` with `statements: [...]` and `expected_rows: [...]`: one transaction |
+| `preflight_statement` once per step of one change | `preflight_statement` with `statements: [...]`, in order |
+| `database_health`, `database_overview` and `schema_issues` per database | `database_health` with `include: ["overview", "schema_issues"]`, plus `connection_ids: [...]` or `scope: "local"` |
+
 ## 2. Reading and investigating
 
 - **The whole schema:** `get_schema` returns every table with its columns, keys and foreign keys in one call. Use it for "what's the schema?" and to orient yourself; never call `get_table_ddl` once per table to build the same picture.
-- **One table in depth:** `get_table_ddl` gives indexes, defaults, foreign keys and `referenced_by`. Use it on the table you're about to change.
-- **A table or column by name:** `search_schema` finds them by fragment. Look names up instead of guessing.
+- **Tables in depth:** `get_table_ddl` gives indexes, defaults, foreign keys, `referenced_by` and a row estimate. Use it on the tables you're about to change, all of them in one call with `tables`.
+- **Row counts:** `list_tables` gives estimates; `exact_counts: true` (or `get_table_ddl` with `row_counts: "exact"`) counts them exactly, skipping tables too big to count cheaply and saying so.
+- **A table or column by name:** `search_schema` finds them by fragment (`patterns` for several). Look names up instead of guessing.
 - **An ER diagram, or "show me how the tables relate":** call `er_diagram`. It opens TableStudio's own interactive diagram on the user's screen and returns `diagram_url`; tell them it's open and give them the link. Don't draw a diagram yourself (no Mermaid, ASCII, image or artifact): TableStudio's is live, complete and explorable. `focus_table` centres it on one table.
-- Run reads with `execute_query`. Select the columns you need, filter, aggregate, and `LIMIT`. Results are capped (`max_rows`, default 200), so a `truncated` result is not the whole answer.
+- Run reads with `read_query` (several independent ones at once with `queries`). It can never change anything, so clients run it without asking; keep `execute_query` for writes. Select the columns you need, filter, aggregate, and `LIMIT`. Results are capped (`max_rows`, default 200; 50 per query in `queries`), so a `truncated` result is not the whole answer.
+- **What's running right now** ("why is it slow?", "what's holding the lock?"): `active_queries`. To stop stuck queries on a development or local database, `cancel_query` with their `pids`, or `min_seconds: 60` for every query over a minute in one step. On production it's refused: tell the user the pid and the query.
 - Reads run in a read-only transaction with a 30-second limit, on production too, so a read can't change data even through a function. Keep them cheap anyway: on a big production table, filter on an indexed column or use `database_overview` row estimates instead of `count(*)`.
 - **A data bug:** reproduce it in the data first. Find the bad rows, count them, and find when they started (`min(created_at)`). Then read the code that writes them. Show the user the query that proves it. Fix the code, and if rows need repairing, that's a data change (section 3).
 - Never paste secrets, passwords or connection strings into SQL, code, docs or chat. The one place a connection string belongs is the project's gitignored env file, for a local database (the local-databases skill covers `get_connection_url`).
@@ -48,10 +67,11 @@ Then:
 
 On **PostgreSQL**:
 
-1. Write the statement, then call `preflight_statement` with it. You get a `verdict` (`looks_fine`, `review` or `would_fail`), `dry_run.rows` (exactly how many rows it would change, read-only), cascades into other tables, and what would make it fail.
+1. Write the statement, then call `preflight_statement` with it. You get a `verdict` (`looks_fine`, `review` or `would_fail`), `dry_run.rows` (exactly how many rows it would change, read-only), cascades into other tables, and what would make it fail. A change made of several statements (delete the children, then the parents) goes in one call as `statements`, in order: `sequence_notes` says when a later statement fails alone only because an earlier one hasn't removed the rows that block it yet.
+   If the request names something the data doesn't have (no `status` column for "cancelled orders", no flag for "test accounts"), stop and ask the user what it means. Don't invent a definition and stage it.
 2. Tell the user what it will do in plain words: "This updates 142 rows in `invoices`; nothing cascades." If the verdict is `would_fail`, fix the statement first. If it's `review`, explain why.
 3. Then either:
-   - **`agent_writes: direct`, and direct writes are allowed:** `execute_query` with `expected_rows` set to `dry_run.rows`. It commits only if exactly that many rows change, and rolls back otherwise. On a remote PostgreSQL database, TableStudio refuses a data change without `expected_rows`.
+   - **`agent_writes: direct`, and direct writes are allowed:** `execute_query` with `expected_rows` set to `dry_run.rows`. It commits only if exactly that many rows change, and rolls back otherwise. On a remote PostgreSQL database, TableStudio refuses a data change without `expected_rows`. A change of several statements goes in one call as `statements`, with `expected_rows` as a list (each statement's `dry_run.rows`, in order): they run as one transaction, and any count that moved rolls back all of them. If a statement uses `now()`, pin the cutoff to a literal timestamp first, so the count can't drift between the dry run and the write.
    - **`agent_writes: review`, writes not allowed, or anything the user should see first:** `stage_migration` with a clear `title`, the SQL, and a `rationale` that includes the dry-run count ("Voids the 142 duplicate invoices found by …"). It goes to the user's review queue in TableStudio's Agent Center and does **not** run.
 
 On **other engines** there's no dry run: first run a `SELECT count(*)` with the same `WHERE`, report the count, then follow the same execute-or-stage rule.
@@ -63,7 +83,7 @@ Before anything destructive on a database that matters (a large DELETE, a DROP, 
 **If the repo uses a migration tool** (Prisma, Drizzle, Rails, Django, Alembic, Laravel, Supabase, Knex, Ecto, TypeORM, Wrangler D1, or plain numbered SQL files; the session context names it when the plugin detected one), the change belongs in that tool:
 
 1. Make the change the tool's way: edit the schema and generate a migration, or write the migration file.
-2. Apply it to the **local development** database with the tool's dev command.
+2. Apply it to the **local development** database with the tool's dev command. For plain numbered SQL files with no runner, run the file's SQL on the local development database with `execute_query` (`statements` keeps it one transaction), and say you did.
 3. Check it against real data (below).
 4. Leave applying it anywhere else to the user's normal deploy process. Never run the tool's deploy command against production yourself.
 
@@ -72,15 +92,16 @@ Running `ALTER TABLE` directly when a migration tool owns the schema leaves the 
 **If there's no migration tool**, or the user asks for a one-off change to an existing database:
 
 1. Read the table first with `get_table_ddl`. Check `referenced_by` before dropping or renaming anything.
-2. Try it on a copy: `create_sandbox` (`data`: `none` for schema only, `sample` for a slice of real rows), run the DDL on the sandbox's connection with `execute_query`, and check it does what you meant.
-3. Show the difference with `compare_schemas` (sandbox as `source_connection_id`, the real database as `target_connection_id`).
+2. Try it on a copy: `create_sandbox` (`data`: `none` for schema only, `sample` for a slice of real rows), run the DDL on the sandbox's connection with `execute_query`, and check it does what you meant. A sample copies at most 100,000 rows per table: when the result says `partial: true`, counts on the sandbox aren't the real database's, so take exact counts from `preflight_statement` on the source.
+3. Show the difference with `compare_schemas` (sandbox as `source_connection_id`, the real database as `target_connection_id`), and give the user its `compare_url` to see the diff in TableStudio.
 4. Propose it with `stage_migration` on the real connection. The user applies it from TableStudio.
+5. `remove_sandbox` when you're done with the copy.
 
 ### Check a migration against real data
 
 A migration that passes on the local database can still fail, or lock the app, where the real rows are. Before you call a migration done, check it read-only against the database it will deploy to (usually staging or production, from the session note or `list_connections`):
 
-1. `get_table_ddl` for each table it alters: how many rows, its indexes, and what references it.
+1. `get_table_ddl` with `tables` set to every table it alters (one call): its row estimate, its indexes, and what references it.
 2. For each constraint it adds, `execute_query` the SELECT that finds rows that would break it:
    - `NOT NULL`: `SELECT count(*) FROM t WHERE col IS NULL`
    - `UNIQUE`: `SELECT col, count(*) FROM t GROUP BY col HAVING count(*) > 1 LIMIT 20`
@@ -107,10 +128,25 @@ Tell the user what you checked and what you found ("`orders.status` has 0 NULLs 
 
 When the user asks what's waiting for them ("what did you stage?", "did my migration run?"), call `list_staged_migrations` for this repo's connections. Report the **pending** ones first, newest first: the title, the connection, when it was staged, its `review_url`, and one line on what it does and how risky it is (does it lock or rewrite a large table, delete data, or lack a `WHERE`?). Then any with **changes requested**, with the user's note, and any that **failed**, with the error. Say plainly that the user applies, sends back or ignores them in TableStudio's Agent Center; you can't apply them yourself.
 
-## 6. When TableStudio says no
+## 6. Links to give the user
+
+TableStudio returns `tablestudio://` links that open the right place in the app. Give them to the user as clickable links whenever they'd help, rather than describing where to click:
+
+| Link | Opens |
+|---|---|
+| `review_url` (stage_migration, list_staged_migrations) | The review of a proposed change, where the user approves it, asks for changes or ignores it |
+| `diagram_url` (get_schema, er_diagram) | TableStudio's interactive ER diagram |
+| `compare_url` (compare_schemas) | The diff between two databases in Compare Schemas |
+| `app_url` (get_table_ddl, create_sandbox) | That table, or the sandbox, in TableStudio |
+| `links` (use_database) | The database, its diagram, and this chat's activity |
+| `this_chat_activity` (list_connections, use_database, stage_migration) | Everything this chat did, in the Agent Center |
+
+## 7. When TableStudio says no
 
 - A refusal that names a setting (for example, writes are off) is the user's choice. Tell them which setting would allow it, offer to stage the change instead, and stop. Don't route around it.
 - If TableStudio's tools aren't available at all, the session note says why: the app is closed, its MCP server is off (Settings → MCP), or the client isn't connected to it yet. Pass on the fix it gives. In Claude Code, the user can reconnect with `/mcp` once TableStudio is open.
 - A refusal with `blocked: production_review_required` or `review_required` means that connection only takes changes through review: stage it. `dry_run_required` means run `preflight_statement` first and pass `expected_rows`. `side_effect_function` means the statement calls something that acts outside a transaction; show the user the SQL instead.
+- `agent_access_structure` or `agent_access_read` is the user's limit for that database: say what it allows, offer what fits (the schema, or a staged change), and don't look for another way to the data. `write_in_read_query` means use `execute_query` for that write. `rate_limited` means slow down: use the list forms instead of one call per item.
+- A local database whose server is stopped fails at once with the `instance_id` to pass to `start_local_database`. Start it only if the user wants to work on it.
 - The plugin's shell guard blocks shell commands that write to production. Treat a block as a signal to use the steps above, not as something to work around.
 - Everything you do through TableStudio is shown to the user in its Agent Center, grouped by this conversation.

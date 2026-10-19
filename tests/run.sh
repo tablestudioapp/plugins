@@ -237,6 +237,24 @@ ctx="$(start claude "$PROJECT" resume)"
 [ -z "$ctx" ]; report $((1 - $?)) "silent on resume" "got: $ctx"
 
 if [ "$ON_MAC" = 1 ]; then
+    echo "Session start: no database in the folder"
+    # A copy of the prefs where the user turned agent access off for one connection.
+    OFF_PREFS="$(mktemp -d)/sh.tablestudio.plist"
+    cp "$PREFS" "$OFF_PREFS"
+    plutil -insert agentAccessLevels -json '{"55555555-5555-4555-8555-555555555555":"off","11111111-1111-4111-8111-111111111111":"structure"}' "$OFF_PREFS"
+    text="$(TABLESTUDIO_PREFS="$OFF_PREFS" start claude "$EMPTY" | jq -r '.hookSpecificOutput.additionalContext' 2>/dev/null)"
+    check "still gives a note with no database in the folder" 'This folder doesn.t configure a database'
+    check "says to choose with use_database" 'call use_database with it'
+    check "lists the saved databases" '- "Acme local" \(postgres, local'
+    check "marks production as named-only" '- "Acme prod" \(postgres, remote, PRODUCTION: only when the user names it'
+    check "marks an untagged remote one" 'untagged: treat as production'
+    check "says when agents see structure only" 'Acme local.*agents see structure only'
+    check_absent "never lists a connection set to Off" 'Analytics'
+    check_absent "leaves sandboxes out of the map" 'Acme sandbox'
+    rm -f "$OFF_PREFS"
+fi
+
+if [ "$ON_MAC" = 1 ]; then
     echo "Session start: with TableStudio set up"
     text="$(TABLESTUDIO_PREFS="$PREFS" start claude "$PROJECT" | jq -r '.hookSpecificOutput.additionalContext' 2>/dev/null)"
     check "names the local connection" 'localhost:5432, database "app" — local → TableStudio connection "Acme local" \(id 11111111-1111-4111-8111-111111111111, development\)'
@@ -248,7 +266,7 @@ if [ "$ON_MAC" = 1 ]; then
     check_absent "doesn't repeat a listed connection in the project list" '- "Acme prod"'
     check_absent "leaves sandboxes out" 'Acme sandbox'
     check_absent "never leaks saved usernames" 'prod_user|analyst'
-    check "tells the agent to use the ids" 'Pass the id shown as connection_id'
+    check "tells the agent to choose the database" 'Call use_database with the id shown'
     check "explains the server is closed" "MCP server isn't answering on localhost:1"
     check "says how to reconnect in Claude Code" 'run /mcp and reconnect plugin:tablestudio:tablestudio'
 

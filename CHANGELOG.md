@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.0
+
+- **A working database per chat.** Agents call `use_database` once they know which database the user means; later calls can leave `connection_id` out, and TableStudio's Agent Center shows each chat's working database. Without one, nothing defaults to production.
+- **Agent access per database.** Off, Structure only, Read, or Read & write, set in the Agent Center. The skills and session note follow it, and a database set to Off never appears in the session note.
+- **`read_query` for reads.** Annotated read-only, so clients that ask before non-read-only tools (Codex) run reads without asking. Dry runs and Query Lab tools are read-only too.
+- **New tools:** `active_queries` and `cancel_query` (refused on production), `remove_sandbox`, `search_server_log`, and `execute_query` with `statements` for one transaction held to each statement's count.
+- **Links:** `compare_url` opens a schema diff in TableStudio, `app_url` opens a table or sandbox, and `this_chat_activity` opens the chat's activity in the Agent Center.
+- **Always a session note.** In a folder with no database settings, the note lists the user's databases (production marked, Off ones left out) and says to choose one with `use_database`.
+- **Hooks report before the call** (Claude Code, Codex, and OpenCode's new before-hook), so the call knows its chat while it runs, and Codex chats are attributed reliably.
+- **Claude Code installs for every project.** `install.sh claude` installs and enables the plugin at user scope; doctor flags an install enabled for one repo only.
+- OpenCode chat titles no longer start with a stray quote.
+- The skill covers `cancel_query` with several pids or `min_seconds`, sizes in `list_tables`, exact counts in `get_schema`, and partial sandbox copies.
+
+## 0.4.2
+
+- **One call, not one per thing.** The skills, Cursor rules and session note send agents to TableStudio's list forms instead of a call per item: `get_table_ddl` with `tables` (and `row_counts: "exact"`), `list_tables` with `exact_counts`, `search_schema` with `patterns`, `execute_query` with `queries` (reads), `preflight_statement` with `statements`, and a whole health check, for one database or every local one, as a single `database_health` call with `include` and `connection_ids` / `scope: "local"`. In test chats these turned 59 calls into about 30. Needs the TableStudio update that adds the list forms.
+- "What databases do I have, and which are running?" is one `list_connections` call: it now reports each local database's server and whether it's running.
+
 ## 0.4.1
 
 - The skill, Cursor rule and session note use TableStudio's `get_schema` and `er_diagram` (below), so a schema question is one call and an ER diagram is TableStudio's own, with a link.
