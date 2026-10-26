@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.10
+
+- **Ready for Anthropic's plugin directory.** The hook script's quoting is written the way every shell reads it, so the directory's checks can follow it, and the Claude Code manifest links the [privacy policy](https://tablestudio.sh/legal/privacy). Nothing changes in what the plugin does.
+
 ## 0.5.9
 
 - **A script written and run in one command is read before it runs.** `cat > fix.py <<'EOF' … EOF; python3 fix.py` was judged by the file on disk, which didn't exist yet, so it got through. The guard now reads what the heredoc writes.

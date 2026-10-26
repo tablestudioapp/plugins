@@ -1,7 +1,7 @@
 {
   "name": "tablestudio",
   "displayName": "TableStudio",
-  "version": "0.5.9",
+  "version": "0.5.10",
   "description": "Your coding agent works on your databases through the TableStudio app: it knows which saved connection each of the repo's databases is, dry-runs writes against real rows, checks new migrations against real data, stages risky changes for your review, and is stopped from writing to production from the shell.",
   "author": {
     "name": "TableStudio"

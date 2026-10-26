@@ -1,6 +1,6 @@
 {
   "name": "tablestudio",
-  "version": "0.5.9",
+  "version": "0.5.10",
   "description": "Your coding agent works on your databases through the TableStudio app: reads run read-only in the database, writes are dry-run against the real rows, production changes go to your review in TableStudio's Agent Center, and the shell can't write to production.",
   "keywords": [
     "database",

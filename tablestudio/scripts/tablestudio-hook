@@ -64,6 +64,7 @@ BUY_URL="https://tablestudio.sh/buy"
 # Sparkle's update feed, which install downloads the app from. TABLESTUDIO_APPCAST_URL is for tests.
 APPCAST_URL="${TABLESTUDIO_APPCAST_URL:-https://updates.tablestudio.sh/appcast.xml}"
 TAB="$(printf '\t')"
+CR="$(printf '\r')"
 NL="$(printf '\nx')"; NL="${NL%x}"
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/$(basename "${BASH_SOURCE[0]}")"
 CURSOR_LOCAL_PLUGIN="$HOME/.cursor/plugins/local/tablestudio"
@@ -124,11 +125,11 @@ json_get() {
 
 json_escape() {
     local s="$1"
-    s="${s//\\/\\\\}"
-    s="${s//\"/\\\"}"
-    s="${s//$'\n'/\\n}"
-    s="${s//$'\r'/\\r}"
-    s="${s//$'\t'/\\t}"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$NL/\\n}
+    s=${s//$CR/\\r}
+    s=${s//$TAB/\\t}
     printf '%s' "$s" | LC_ALL=C tr -d '\000-\037'
 }
 
@@ -541,7 +542,7 @@ env_lookup() {
     local sourced
     while IFS= read -r sourced; do
         [ -n "$sourced" ] || continue
-        sourced="${sourced%\"}"; sourced="${sourced#\"}"; sourced="${sourced%\'}"; sourced="${sourced#\'}"
+        sourced=${sourced%\"}; sourced=${sourced#\"}; sourced=${sourced%\'}; sourced=${sourced#\'}
         for dir in "" "$@"; do
             case "$sourced" in /*) file="$sourced" ;; "~"*) file="$HOME${sourced#\~}" ;; *) [ -n "$dir" ] || continue; file="$dir/$sourced" ;; esac
             [ -f "$file" ] || continue
@@ -571,8 +572,8 @@ clean_env_value() {
     local v="$1"
     v="${v#"${v%%[![:space:]]*}"}"
     case "$v" in
-        \"*) v="${v#\"}"; v="${v%%\"*}" ;;
-        \'*) v="${v#\'}"; v="${v%%\'*}" ;;
+        \"*) v=${v#\"}; v=${v%%\"*} ;;
+        \'*) v=${v#\'}; v=${v%%\'*} ;;
         *)   v="${v%%[[:space:]]#*}"; v="${v%"${v##*[![:space:]]}"}" ;;
     esac
     printf '%s' "$v"
@@ -1407,7 +1408,7 @@ guard_shell() {
     # `cd apps/api && …` runs against that directory's .env and files, so look there first.
     local cd_dir
     cd_dir="$(printf '%s' "$whole" | sed -nE 's/^[[:space:]]*cd[[:space:]]+([^[:space:];&|]+).*/\1/p' | head -n 1)"
-    cd_dir="${cd_dir%\"}"; cd_dir="${cd_dir#\"}"; cd_dir="${cd_dir%\'}"; cd_dir="${cd_dir#\'}"
+    cd_dir=${cd_dir%\"}; cd_dir=${cd_dir#\"}; cd_dir=${cd_dir%\'}; cd_dir=${cd_dir#\'}
     case "$cd_dir" in "") ;; /*) ;; "~"*) cd_dir="$HOME${cd_dir#\~}" ;; *) cd_dir="$dir/$cd_dir" ;; esac
     GUARD_CD_DIR="$cd_dir"
 
@@ -1450,7 +1451,7 @@ EOF
     markers="$(printf '%s' "$cmd" | grep -Eio '([A-Z_]*ENV|DJANGO_SETTINGS_MODULE|STAGE)=[^[:space:]]+|--(env|environment|stage|profile|env-file|target|settings)[=[:space:]]+[^[:space:]]+|\.env\.[a-z]+|\$\{?[A-Za-z_]*(PROD|PRODUCTION|PRD)[A-Za-z0-9_]*\}?' | tr '\n' ' ')"
     markers="$markers $(printf '%s' "$cmd" | grep -Eo "$PKG_SCRIPT_RE" | sed -E 's/.*[[:space:]]//' | tr '\n' ' ')"
     if is_prod_text "$markers"; then
-        prod_evidence="${prod_evidence:-$(printf '%s' "$markers" | tr -s ' ' | sed 's/^ //; s/ $//')}"
+        [ -n "$prod_evidence" ] || prod_evidence="$(printf '%s' "$markers" | tr -s ' ' | sed 's/^ //; s/ $//')"
     fi
 
     # Variables the command expands ($DATABASE_URL), or the one a migration tool reads by default.
@@ -1571,7 +1572,7 @@ is_write_command() {
 sql_file_arg() {
     local file
     file="$(printf '%s' "$1" | grep -Eo '(^|[[:space:]])(-f[[:space:]]*|--file[=[:space:]]+|<[[:space:]]*)[^[:space:]<>|;&]+' | grep -Ev '<<' | head -n 1 | sed -E 's/^[[:space:]]*(-f[[:space:]]*|--file[=[:space:]]+|<[[:space:]]*)//')"
-    file="${file%\"}"; file="${file#\"}"; file="${file%\'}"; file="${file#\'}"
+    file=${file%\"}; file=${file#\"}; file=${file%\'}; file=${file#\'}
     printf '%s' "$file"
 }
 
@@ -1731,7 +1732,7 @@ mcp_stdio() {
     manifest="$(plugin_manifest)"
     : >"$tmp/started"
     while IFS= read -r line || [ -n "$line" ]; do
-        line="${line%$'\r'}"
+        line=${line%$CR}
         [ -n "$line" ] || continue
         n=$((n + 1))
         mkdir "$tmp/$n" 2>/dev/null || continue

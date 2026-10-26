@@ -3,7 +3,7 @@
     "tablestudio": {
       "type": "http",
       "url": "http://localhost:7432",
-      "http_headers_helper": "printf '{\"Authorization\":\"Bearer %s\",\"X-TableStudio-Client\":\"codex\",\"X-TableStudio-Plugin\":\"0.5.9\"}' \"$(/usr/bin/defaults read sh.tablestudio mcpAuthToken 2>/dev/null)\""
+      "http_headers_helper": "printf '{\"Authorization\":\"Bearer %s\",\"X-TableStudio-Client\":\"codex\",\"X-TableStudio-Plugin\":\"0.5.10\"}' \"$(/usr/bin/defaults read sh.tablestudio mcpAuthToken 2>/dev/null)\""
     }
   }
 }
