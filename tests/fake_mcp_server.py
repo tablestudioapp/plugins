@@ -25,6 +25,20 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_GET(self):
+        if self.headers.get("Authorization") != f"Bearer {TOKEN}":
+            return self.reply(401, b'{"error":"Unauthorized"}')
+        if self.path != "/license":
+            return self.reply(404, b'{"error":"Not found"}')
+        # The license TableStudio reports: "trial" unless the tests write another status into
+        # <log file>.license. Slashes escaped, as the app's JSONSerialization writes them.
+        try:
+            with open(LOG + ".license") as f:
+                status = f.read().strip()
+        except OSError:
+            status = "trial"
+        self.reply(200, ('{"buy_url":"https:\\/\\/tablestudio.sh\\/buy","status":"%s"}' % status).encode())
+
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
         with open(LOG, "a") as log:
