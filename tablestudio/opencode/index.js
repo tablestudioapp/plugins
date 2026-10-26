@@ -27,6 +27,14 @@ const hookScript = path.join(root, "scripts", "tablestudio-hook")
 const MIGRATION_PATH = /(^|\/)(migrations|migrate|alembic\/versions)\/[^/]+|\.prisma$|(^|\/)drizzle\/[^/]*\.sql$/
 
 /** Problems go to ~/Library/Logs/TableStudio/opencode-plugin.log rather than OpenCode's screen. */
+function logGuard(line) {
+  try {
+    const dir = path.join(os.homedir(), "Library", "Logs", "TableStudio")
+    mkdirSync(dir, { recursive: true })
+    appendFileSync(path.join(dir, "opencode-plugin.log"), `${new Date().toISOString()} guard ${line}\n`)
+  } catch {}
+}
+
 function logProblem(step, error) {
   try {
     const dir = path.join(os.homedir(), "Library", "Logs", "TableStudio")
@@ -190,15 +198,22 @@ export default {
 
     // Shell guard. OpenCode asks for permission itself, so a write to a remote database gets
     // OpenCode's own approval prompt and a production write is denied outright.
+    const shellDecision = async (command, sessionID, via) => {
+      const decision = hookOutput(await runHook(["guard-shell", "opencode"], {
+        tool_input: { command },
+        cwd: directory,
+        session_id: sessionID,
+      }, directory, 10000))
+      // Which way each check came, and what it decided — never the command, which can hold a
+      // password — so a run that slipped past can be told from one the guard never saw.
+      logGuard(`${via}: ${decision.permissionDecision ?? "none"}`)
+      return decision
+    }
     await register("guard", ctx.permission.hook("evaluate", guarded("guard", async (evaluation) => {
       if (evaluation.action !== "shell") return
       const command = evaluation.metadata?.command ?? evaluation.resources?.[0]
       if (typeof command !== "string" || !command) return
-      const decision = hookOutput(await runHook(["guard-shell", "opencode"], {
-        tool_input: { command },
-        cwd: directory,
-        session_id: evaluation.sessionID,
-      }, directory, 10000))
+      const decision = await shellDecision(command, evaluation.sessionID, "permission")
       if (decision.permissionDecision === "deny") {
         evaluation.effect = "deny"
         evaluation.message = decision.permissionDecisionReason
@@ -207,6 +222,22 @@ export default {
         evaluation.message = decision.permissionDecisionReason
       }
     })))
+
+    // The same guard on the shell tool itself, for a command no permission check was asked about
+    // (shell already allowed in the user's config). Throwing stops the call, with the reason as
+    // its error; anything that goes wrong in the check itself lets the command through as before.
+    await register("guard-tool", ctx.tool.hook("execute.before", async (call) => {
+      if (!/^(shell|bash)$/i.test(call.tool ?? "")) return
+      const command = call.input?.command ?? call.args?.command
+      if (typeof command !== "string" || !command) return
+      let decision = {}
+      try {
+        decision = await shellDecision(command, call.sessionID, "tool")
+      } catch (error) {
+        logProblem("guard-tool", error)
+      }
+      if (decision.permissionDecision === "deny") throw new Error(decision.permissionDecisionReason)
+    }))
 
     // Which conversation is making a TableStudio call, reported before it runs and awaited, so
     // TableStudio knows the chat while the call is in flight: its chosen database (use_database)

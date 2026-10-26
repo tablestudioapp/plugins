@@ -6,7 +6,7 @@
 #   tests/run.sh -v         also print each passing case
 
 cd "$(dirname "$0")/.." || exit 1
-HOOK="tablestudio/scripts/tablestudio-hook"
+HOOK="${HOOK:-tablestudio/scripts/tablestudio-hook}"
 PROJECT="$PWD/tests/fixtures/project"
 EMPTY="$PWD/tests/fixtures/empty-project"
 PREFS="$PWD/tests/fixtures/prefs/sh.tablestudio.plist"
@@ -22,7 +22,7 @@ SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
 export HOME="$SCRATCH/home" CLAUDE_PLUGIN_DATA="$SCRATCH/data"
 export TABLESTUDIO_PREFS=/nonexistent/sh.tablestudio.plist TABLESTUDIO_APP_PATH=/nonexistent/TableStudio.app
-export TABLESTUDIO_OPEN_APP=0
+export TABLESTUDIO_OPEN_APP=0 TABLESTUDIO_INSTALL_APP=0 TABLESTUDIO_APPCAST_URL=file:///nonexistent/appcast.xml
 mkdir -p "$HOME"
 
 ON_MAC=0
@@ -258,6 +258,86 @@ if [ "$ON_MAC" = 1 ]; then
     check_absent "never lists a connection set to Off" 'Analytics'
     check_absent "leaves sandboxes out of the map" 'Acme sandbox'
     rm -f "$OFF_PREFS"
+
+    echo "Shell guard: TableStudio's own settings for a database, however a command reaches it"
+    # A production database whose name says nothing, and two SQLite files the user restricted.
+    TAGGED_DIR="$(mktemp -d)"
+    TAGGED_PREFS="$TAGGED_DIR/sh.tablestudio.plist"
+    cp "$PREFS" "$TAGGED_PREFS"
+    TAGGED_CONNECTIONS="[{\"id\":\"66666666-6666-4666-8666-666666666666\",\"name\":\"Shop\",\"kind\":\"postgres\",\"host\":\"127.0.0.1\",\"port\":5434,\"database\":\"shop_main\",\"username\":\"postgres\",\"password\":\"\",\"environment\":\"production\",\"readOnly\":false,\"isSandbox\":false},{\"id\":\"77777777-7777-4777-8777-777777777777\",\"name\":\"Shop dev\",\"kind\":\"postgres\",\"host\":\"127.0.0.1\",\"port\":5434,\"database\":\"shop_dev\",\"username\":\"postgres\",\"password\":\"\",\"environment\":\"development\",\"readOnly\":false,\"isSandbox\":false},{\"id\":\"AAAAAAAA-0000-4000-8000-000000000001\",\"name\":\"Server admin\",\"kind\":\"postgres\",\"host\":\"127.0.0.1\",\"port\":5434,\"database\":\"postgres\",\"username\":\"postgres\",\"password\":\"\",\"environment\":\"production\",\"readOnly\":true,\"isSandbox\":false},{\"id\":\"88888888-8888-4888-8888-888888888888\",\"name\":\"Payroll\",\"kind\":\"sqlite\",\"host\":\"\",\"port\":0,\"database\":\"payroll\",\"filePath\":\"$TAGGED_DIR/payroll.sqlite\",\"password\":\"\",\"isSandbox\":false},{\"id\":\"99999999-9999-4999-8999-999999999999\",\"name\":\"Secrets\",\"kind\":\"sqlite\",\"host\":\"\",\"port\":0,\"database\":\"secrets\",\"filePath\":\"$TAGGED_DIR/secrets.sqlite\",\"password\":\"\",\"isSandbox\":false},{\"id\":\"BBBBBBBB-0000-4000-8000-000000000002\",\"name\":\"Vault\",\"kind\":\"sqlite\",\"host\":\"\",\"port\":0,\"database\":\"vault\",\"filePath\":\"$TAGGED_DIR/Application Support/vault_hidden.sqlite\",\"password\":\"\",\"isSandbox\":false}]"
+    plutil -replace postgres_connections -data "$(printf '%s' "$TAGGED_CONNECTIONS" | base64)" "$TAGGED_PREFS"
+    plutil -insert agentAccessLevels -json '{"88888888-8888-4888-8888-888888888888":"structure","99999999-9999-4999-8999-999999999999":"off","BBBBBBBB-0000-4000-8000-000000000002":"off"}' "$TAGGED_PREFS"
+    tagged() { TABLESTUDIO_PREFS="$TAGGED_PREFS" guard "$@"; }
+    tagged deny 'psql -h /tmp/tables-020DA161 -p 5434 -U postgres shop_main -c "UPDATE canary SET note = 1 WHERE id = 1"'
+    tagged deny "psql postgresql://postgres@127.0.0.1:5434/shop_main -c 'DELETE FROM canary'"
+    tagged deny "python3 -c \"import psycopg2; c = psycopg2.connect(host='127.0.0.1', port=5434, dbname='shop_main', user='postgres'); c.cursor().execute('UPDATE canary SET note = 2')\""
+    tagged deny "node -e \"const {Client} = require('pg'); new Client('postgres://postgres@localhost:5434/shop_main').connect().then(c => c.query('DELETE FROM canary'))\""
+    tagged deny "PGPORT=5434 PGDATABASE=shop_main psql -h localhost -c 'TRUNCATE canary'"
+    tagged deny "sqlite3 $TAGGED_DIR/payroll.sqlite 'SELECT * FROM payroll'"
+    tagged deny "sqlite3 -readonly $TAGGED_DIR/secrets.sqlite 'SELECT count(*) FROM secrets'"
+    tagged deny "python3 -c \"import sqlite3; print(sqlite3.connect('$TAGGED_DIR/secrets.sqlite').execute('select 1').fetchall())\""
+    out="$(jq -n --arg c "sqlite3 $TAGGED_DIR/secrets.sqlite 'select 1'" --arg d "$PROJECT" '{tool_name: "Bash", tool_input: {command: $c}, cwd: $d}' \
+        | TABLESTUDIO_PREFS="$TAGGED_PREFS" /bin/bash "$HOOK" guard-shell claude)"
+    ! printf '%s' "$out" | grep -q 'Secrets'; report $((1 - $?)) "never names a database set to Off" "got: $out"
+    # Reads of production pass, as they do through TableStudio at Read; so does a development write.
+    tagged none 'psql -h 127.0.0.1 -p 5434 shop_main -c "SELECT count(*) FROM canary"'
+    tagged none 'psql -h 127.0.0.1 -p 5434 shop_dev -c "UPDATE canary SET note = 3"'
+    # The user name isn't a database name, unless psql has nothing else to go on.
+    tagged none 'psql -h 127.0.0.1 -p 5434 -U postgres shop_dev -c "UPDATE canary SET note = 3"'
+    tagged deny 'psql -h 127.0.0.1 -p 5434 -U postgres -c "UPDATE settings SET v = 1"'
+    tagged none "sqlite3 $TAGGED_DIR/other.sqlite 'SELECT 1'"
+    tagged none 'ls -la'
+    # A path with a space, however it's written, a file: URI, and a restricted file by its name alone.
+    tagged deny "sqlite3 '$TAGGED_DIR/Application Support/vault_hidden.sqlite' 'select 1'"
+    tagged deny "sqlite3 ${TAGGED_DIR}/Application\\ Support/vault_hidden.sqlite 'select 1'"
+    tagged deny "python3 -I -c \"import sqlite3; sqlite3.connect('file:$TAGGED_DIR/Application%20Support/vault_hidden.sqlite?mode=ro', uri=True)\""
+    tagged deny "python3 -c \"import sqlite3; sqlite3.connect('file:$TAGGED_DIR/secrets.sqlite?mode=ro', uri=True).execute('select 1')\""
+    tagged deny "strings $TAGGED_DIR/secrets.sqlite | head"
+    tagged deny "cat $TAGGED_DIR/payroll.sqlite > /tmp/copy.bin"
+    tagged deny "cp ~/Library/Instances/*/vault_hidden.sqlite /tmp/v.db"
+    # What a script or .sql file would run counts as much as what's on the command line.
+    printf 'UPDATE canary SET note = 9 WHERE id = 1;\n' >"$TAGGED_DIR/fix.sql"
+    printf 'SELECT count(*) FROM canary;\n' >"$TAGGED_DIR/report.sql"
+    printf 'import psycopg2\nc = psycopg2.connect(host="127.0.0.1", port=5434, dbname="shop_main")\nc.cursor().execute("UPDATE canary SET note = 7")\nc.commit()\n' >"$TAGGED_DIR/fix_canary.py"
+    printf 'import os, psycopg2\nc = psycopg2.connect(os.environ["DATABASE_URL"])\nc.cursor().execute("DELETE FROM canary")\n' >"$TAGGED_DIR/fix_env.py"
+    printf 'DATABASE_URL=postgresql://postgres@127.0.0.1:5434/shop_main\n' >"$TAGGED_DIR/.env"
+    tagged deny "psql -h 127.0.0.1 -p 5434 -d shop_main -f $TAGGED_DIR/fix.sql"
+    tagged deny "psql -h 127.0.0.1 -p 5434 shop_main < $TAGGED_DIR/fix.sql"
+    tagged none "psql -h 127.0.0.1 -p 5434 -d shop_main -f $TAGGED_DIR/report.sql"
+    tagged deny "psql -h 127.0.0.1 -p 5434 -d shop_main -f $TAGGED_DIR/missing.sql"
+    tagged deny "python3 $TAGGED_DIR/fix_canary.py"
+    tagged deny "cd $TAGGED_DIR && python3 fix_canary.py"
+    tagged deny "python3 fix_env.py" "$TAGGED_DIR"
+    tagged deny "$(printf 'python3 <<%sPY%s\nimport psycopg2\nc = psycopg2.connect(host="127.0.0.1", port=5434, dbname="shop_main")\nc.cursor().execute("UPDATE canary SET note = 4")\nPY' "'" "'")"
+    tagged deny 'echo "UPDATE canary SET note = 6" | psql -h 127.0.0.1 -p 5434 shop_main'
+    tagged deny 'export PGHOST=127.0.0.1 PGPORT=5434 PGDATABASE=shop_main; psql -c "UPDATE canary SET note = 5"'
+    # Each part on its own: a development write next to a production read passes.
+    tagged none 'psql -h 127.0.0.1 -p 5434 shop_dev -c "CREATE TABLE t (id int)" && psql -h 127.0.0.1 -p 5434 shop_main -c "SELECT count(*) FROM canary"'
+    tagged none 'pg_dump -h 127.0.0.1 -p 5434 shop_main | psql -h 127.0.0.1 -p 5434 shop_dev'
+    tagged deny 'psql -h 127.0.0.1 -p 5434 shop_dev -c "SELECT 1" && psql -h 127.0.0.1 -p 5434 shop_main -c "DELETE FROM canary"'
+    # A script the same command writes, then runs.
+    tagged deny "$(printf 'cat > %s/later.py <<%sEOF%s\nimport psycopg2\nc = psycopg2.connect(host="127.0.0.1", port=5434, dbname="shop_main")\nc.cursor().execute("UPDATE canary SET note = 8")\nEOF\npython3 %s/later.py' "$TAGGED_DIR" "'" "'" "$TAGGED_DIR")"
+    # The database named through a variable, from the project's .env or one the command sources.
+    DEV_DIR="$TAGGED_DIR/devapp"; mkdir -p "$DEV_DIR/app"
+    printf 'DATABASE_URL=postgresql://postgres@127.0.0.1:5434/shop_dev\n' >"$DEV_DIR/.env"
+    printf 'DATABASE_URL=postgresql://postgres@127.0.0.1:5434/shop_dev\n' >"$DEV_DIR/app/.env"
+    printf 'DATABASE_URL=postgresql://postgres@127.0.0.1:5434/shop_main\n' >"$DEV_DIR/app/live.env"
+    tagged none 'psql "$DATABASE_URL" -c "CREATE TABLE t (id int)" && psql -h 127.0.0.1 -p 5434 shop_main -c "SELECT 1"' "$DEV_DIR"
+    tagged none 'set -a; source app/.env; psql "$DATABASE_URL" -c "ALTER TABLE t ADD COLUMN c int"' "$DEV_DIR"
+    tagged deny 'set -a; . app/live.env; psql "$DATABASE_URL" -c "ALTER TABLE t ADD COLUMN c int"' "$DEV_DIR"
+    rm -rf "$TAGGED_DIR"
+
+    echo "Session start: no folder open"
+    # An empty window runs the hook from the home folder; a project a few levels down isn't this one.
+    mkdir -p "$HOME/Desktop/shop"
+    cp "$PROJECT/.env" "$HOME/Desktop/shop/.env"
+    text="$(TABLESTUDIO_PREFS="$PREFS" start cursor "$HOME" | jq -r '.additional_context' 2>/dev/null)"
+    check "says no project folder is open" 'No project folder is open'
+    check "still lists the saved databases" '- "Acme local" \(postgres, local'
+    check_absent "doesn't take a project under the home folder for this one" "database settings|Desktop/shop"
+    text="$(TABLESTUDIO_PREFS="$PREFS" start cursor / | jq -r '.additional_context' 2>/dev/null)"
+    check "the filesystem root counts as no folder too" 'No project folder is open'
+    rm -rf "$HOME/Desktop"
 fi
 
 if [ "$ON_MAC" = 1 ]; then
@@ -341,6 +421,8 @@ if [ "$ON_MAC" = 1 ]; then
     printf '%s' "$out" | grep -q 'prisma/schema.prisma'; report $((1 - $?)) "a Prisma schema edit counts" "got: $out"
     out="$(after claude m4 Bash 'npx prisma migrate dev --name add_status')"
     printf '%s' "$out" | grep -q 'prisma migrate dev'; report $((1 - $?)) "generating a migration counts" "got: $out"
+    out="$(after claude m10 Bash "$(printf 'cat >> reports/run.md <<%sEOF%s\nRan npx prisma migrate dev and ALTER TABLE t ADD COLUMN x int.\nEOF' "'" "'")")"
+    [ -z "$out" ]; report $((1 - $?)) "not for a report that only quotes a migration command" "got: $out"
     out="$(after claude m5 Bash 'npm test')"
     [ -z "$out" ]; report $((1 - $?)) "not for other commands" "got: $out"
     out="$(after cursor m6 Write "$PROJECT/db/migrate/20250101_add_status.rb")"
@@ -361,6 +443,38 @@ if [ "$ON_MAC" = 1 ]; then
     [ "$(printf '%s' "$out" | jq -r '."X-TableStudio-Project"')" = "$PWD" ]; report $((1 - $?)) "and from which project" "got: $out"
     out="$(/bin/bash "$HOOK" mcp-headers </dev/null 2>/dev/null)"; code=$?
     [ -z "$out" ] && [ "$code" -ne 0 ]; report $((1 - $?)) "fails without a token" "got $code: $out"
+    # In a project with a database and TableStudio's server not answering, it opens TableStudio,
+    # but never a second copy beside one that's open (a development build, say).
+    mkdir -p "$SCRATCH/open-bin" "$SCRATCH/Open.app/Contents/MacOS"
+    printf '#!/bin/sh\necho "$*" >>"%s/open.log"\n' "$SCRATCH" >"$SCRATCH/open-bin/open"
+    chmod +x "$SCRATCH/open-bin/open"
+    printf '#!/bin/bash\nwhile :; do sleep 1; done\n' >"$SCRATCH/Open.app/Contents/MacOS/TableStudio"
+    chmod +x "$SCRATCH/Open.app/Contents/MacOS/TableStudio"
+    headers_opening() { # headers_opening <app path> [prefs] — mcp-headers in the project, `open` recorded
+        local hook="$PWD/$HOOK"
+        : >"$SCRATCH/open.log"
+        (cd "$PROJECT" && PATH="$SCRATCH/open-bin:$PATH" TABLESTUDIO_OPEN_APP=1 TABLESTUDIO_APP_PATH="$1" \
+            TABLESTUDIO_PREFS="${2:-$PREFS}" CLAUDE_CODE_MCP_SERVER_URL=http://localhost:1 /bin/bash "$hook" mcp-headers </dev/null >/dev/null 2>&1)
+    }
+    headers_opening "$SCRATCH/Closed.app"
+    grep -q -- "-b sh.tablestudio" "$SCRATCH/open.log"; report $((1 - $?)) "opens TableStudio when it's closed" "open got: $(cat "$SCRATCH/open.log")"
+    # The copy that ran last, which the app records, not the one Launch Services knows.
+    mkdir -p "$SCRATCH/Dev.app"
+    cp "$PREFS" "$SCRATCH/dev-prefs.plist"
+    plutil -replace appBundlePath -string "$SCRATCH/Dev.app" "$SCRATCH/dev-prefs.plist"
+    headers_opening "$SCRATCH/Closed.app" "$SCRATCH/dev-prefs.plist"
+    [ "$(cat "$SCRATCH/open.log")" = "-g -j $SCRATCH/Dev.app" ]; report $((1 - $?)) "opens the copy that ran last" "open got: $(cat "$SCRATCH/open.log")"
+    "$SCRATCH/Open.app/Contents/MacOS/TableStudio" &
+    OPEN_APP_PID=$!
+    headers_opening "$SCRATCH/Open.app"
+    kill "$OPEN_APP_PID" 2>/dev/null
+    [ ! -s "$SCRATCH/open.log" ]; report $((1 - $?)) "but not a second copy beside one that's open" "open got: $(cat "$SCRATCH/open.log")"
+    # Restarting (an update, a rebuild): back a second later, so nothing is opened beside it.
+    (sleep 1; exec "$SCRATCH/Open.app/Contents/MacOS/TableStudio") &
+    OPEN_APP_PID=$!
+    headers_opening "$SCRATCH/Open.app"
+    kill "$OPEN_APP_PID" 2>/dev/null
+    [ ! -s "$SCRATCH/open.log" ]; report $((1 - $?)) "nor while it restarts" "open got: $(cat "$SCRATCH/open.log")"
 
     # A fake TableStudio for the bridge and the attribution hook.
     FAKE_PORT=$((20000 + RANDOM % 20000))
@@ -387,9 +501,78 @@ if [ "$ON_MAC" = 1 ]; then
     [ "$(printf '%s' "$last" | jq -r '.headers."Authorization"')" = 'Bearer test-token-0000' ]; report $((1 - $?)) "sends TableStudio's token, read from the app" "got: $last"
     [ "$(printf '%s' "$last" | jq -r '.headers."X-TableStudio-Client"')" = cursor ]; report $((1 - $?)) "says which client it is" "got: $last"
     [ "$(printf '%s' "$last" | jq -r '.headers."MCP-Protocol-Version" // .headers."Mcp-Protocol-Version"')" = 2025-06-18 ]; report $((1 - $?)) "sends the protocol version initialize agreed" "got: $last"
+    out="$(printf '%s\n' \
+        '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' \
+        '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+        '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_connections","arguments":{}}}' \
+        '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_connections","arguments":{}}}' \
+        '{"jsonrpc":"2.0","id":3,"method":"tools/list"}' \
+        '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_connections","arguments":{}}}' |
+        TABLESTUDIO_PREFS="$SCRATCH/fake.plist" /bin/bash "$HOOK" mcp-stdio cursor)"
+    ids="$(printf '%s\n' "$out" | jq -r '.id' 2>/dev/null | sort | tr '\n' ' ')"
+    [ "$ids" = "0 1 2 3 4 " ]; report $((1 - $?)) "calls in flight together each come back whole, once" "got ids: $ids, output: $out"
     out="$(printf '%s\n' '{"jsonrpc":"2.0","id":5,"method":"tools/list"}' | TABLESTUDIO_PREFS="$SCRATCH/fake.plist" TABLESTUDIO_MCP_PORT=1 /bin/bash "$HOOK" mcp-stdio opencode)"
     [ "$(printf '%s' "$out" | jq -r '.id')" = 5 ] && printf '%s' "$out" | jq -r '.error.message' | grep -q "isn't answering"
     report $((1 - $?)) "a JSON-RPC error when TableStudio isn't running" "got: $out"
+
+    # An update replaces the plugin under a running bridge: it moves to the new copy by itself.
+    SWAP="$SCRATCH/swap"
+    mkdir -p "$SWAP" && cp -R tablestudio "$SWAP/tablestudio" && mkfifo "$SWAP/in"
+    : >"$FAKE_LOG"
+    TABLESTUDIO_PREFS="$SCRATCH/fake.plist" /bin/bash "$SWAP/tablestudio/scripts/tablestudio-hook" mcp-stdio opencode <"$SWAP/in" >"$SWAP/out" &
+    SWAP_PID=$!
+    exec 7>"$SWAP/in"
+    printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' \
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' >&7
+    for _ in 1 2 3 4 5 6 7 8 9 10; do [ "$(wc -l <"$SWAP/out" | tr -d ' ')" -ge 2 ] && break; sleep 0.2; done
+    sleep 1.1 # modification times compare to the second
+    sed -i '' 's/"version"[[:space:]]*:[[:space:]]*"[^"]*"/"version": "9.9.9"/' "$SWAP/tablestudio/.claude-plugin/plugin.json"
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' '{"jsonrpc":"2.0","id":3,"method":"tools/list"}' >&7
+    exec 7>&-
+    wait "$SWAP_PID"
+    ids="$(jq -r '.id' "$SWAP/out" 2>/dev/null | sort | tr '\n' ' ')"
+    first="$(grep -v '/agent/events' "$FAKE_LOG" | head -n 1)"; last="$(grep -v '/agent/events' "$FAKE_LOG" | tail -n 1)"
+    [ "$ids" = "0 1 2 3 " ] && [ "$(printf '%s' "$last" | jq -r '.headers."X-TableStudio-Plugin"')" = 9.9.9 ]
+    report $((1 - $?)) "an updated plugin takes over a running bridge, with every call answered" "got ids: $ids, last: $last"
+    [ "$(printf '%s' "$first" | jq -r '.headers."X-TableStudio-Bridge"')" = "$(printf '%s' "$last" | jq -r '.headers."X-TableStudio-Bridge"')" ] &&
+        [ "$(printf '%s' "$last" | jq -r '.headers."MCP-Protocol-Version" // .headers."Mcp-Protocol-Version"')" = 2025-06-18 ]
+    report $((1 - $?)) "and keeps the same MCP session" "first: $first, last: $last"
+
+    # Cursor loads Claude Code's copy of the plugin besides its own. Only its own acts.
+    CURSOR_HOME="$SCRATCH/cursor-home"
+    CURSOR_COPY="$CURSOR_HOME/.cursor/plugins/local/tablestudio"
+    mkdir -p "$(dirname "$CURSOR_COPY")" && cp -R tablestudio "$CURSOR_COPY"
+    sed -i '' 's/"version"[[:space:]]*:[[:space:]]*"[^"]*"/"version": "8.8.8"/' "$CURSOR_COPY/.claude-plugin/plugin.json"
+    : >"$FAKE_LOG"
+    printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' |
+        HOME="$CURSOR_HOME" TABLESTUDIO_PREFS="$SCRATCH/fake.plist" /bin/bash "$HOOK" mcp-stdio cursor >/dev/null
+    [ "$(tail -n 1 "$FAKE_LOG" | jq -r '.headers."X-TableStudio-Plugin"')" = 8.8.8 ]
+    report $((1 - $?)) "[cursor] another copy hands the MCP bridge to Cursor's own" "got: $(tail -n 1 "$FAKE_LOG")"
+    write="$(jq -n --arg d "$PROJECT" '{command: "psql -h db.prod.example.com -c \"DELETE FROM users\"", cwd: $d, workspace_roots: [$d], hook_event_name: "beforeShellExecution"}')"
+    out="$(printf '%s' "$write" | HOME="$CURSOR_HOME" /bin/bash "$HOOK" guard-shell cursor)"
+    [ "$out" = '{"permission":"allow"}' ]; report $((1 - $?)) "[cursor] and leaves the shell guard to it" "got: $out"
+    out="$(printf '%s' "$write" | HOME="$CURSOR_HOME" /bin/bash "$CURSOR_COPY/scripts/tablestudio-hook" guard-shell cursor)"
+    [ "$(printf '%s' "$out" | jq -r '.permission')" = deny ]; report $((1 - $?)) "[cursor] which guards as usual" "got: $out"
+    out="$(jq -n --arg d "$PROJECT" '{hook_event_name: "sessionStart", workspace_roots: [$d]}' |
+        HOME="$CURSOR_HOME" /bin/bash "$HOOK" session-start cursor)"
+    [ -z "$out" ]; report $((1 - $?)) "[cursor] and leaves the session note to it" "got: $out"
+
+    echo "After the trial"
+    note() {
+        jq -n --arg d "$PROJECT" '{hook_event_name: "SessionStart", source: "startup", cwd: $d, workspace_roots: [$d]}' |
+            TABLESTUDIO_PREFS="$SCRATCH/fake.plist" TABLESTUDIO_MCP_PORT="$FAKE_PORT" /bin/bash "$HOOK" session-start claude |
+            jq -r '.hookSpecificOutput.additionalContext'
+    }
+    printf 'expired\n' >"$FAKE_LOG.license"
+    text="$(note)"
+    check "the session note says the trial has ended, and where to buy" 'free trial has ended.*tablestudio\.sh/buy'
+    check_absent "and doesn't offer tools that only refuse" 'mcp__plugin_tablestudio_tablestudio__list_connections'
+    out="$(TABLESTUDIO_PREFS="$SCRATCH/fake.plist" /bin/bash "$HOOK" doctor 2>&1)"
+    printf '%s' "$out" | grep -q 'free trial has ended' && printf '%s' "$out" | grep -q 'tablestudio\.sh/buy'
+    report $((1 - $?)) "doctor says the trial has ended, and where to buy" "got: $out"
+    rm -f "$FAKE_LOG.license"
+    text="$(note)"
+    check "during the trial the tools are offered as usual" 'TableStudio is running \(MCP on localhost'
 
     echo "Which chat made a call"
     : >"$FAKE_LOG"
@@ -431,6 +614,72 @@ fi
 HOME="$INST/home" /bin/bash "$HOOK" install cursor >/dev/null 2>&1
 [ -f "$INST/home/.cursor/plugins/local/tablestudio/.cursor-plugin/plugin.json" ] && [ -f "$INST/home/.cursor/plugins/local/tablestudio/cursor-mcp.json" ]
 report $((1 - $?)) "[cursor] copies the plugin, MCP entry included, where Cursor loads local plugins" "got: $(ls -a "$INST/home/.cursor/plugins/local/tablestudio" 2>&1)"
+: >"$INST/home/.cursor/plugins/local/tablestudio/stale-file"
+out="$(HOME="$INST/home" /bin/bash "$HOOK" install cursor 2>&1)"
+[ ! -e "$INST/home/.cursor/plugins/local/tablestudio/stale-file" ] && [ -f "$INST/home/.cursor/plugins/local/tablestudio/cursor-mcp.json" ] &&
+    [ "$(ls -a "$INST/home/.cursor" | grep -c tablestudio-plugin)" = 0 ] && printf '%s' "$out" | grep -q 'moves to it by itself'
+report $((1 - $?)) "[cursor] an update replaces the copy whole, leaving nothing behind" "got: $(ls -a "$INST/home/.cursor" "$INST/home/.cursor/plugins/local/tablestudio" 2>&1) $out"
+
+if [ "$ON_MAC" = 1 ]; then
+    echo "Installer: TableStudio itself"
+    APPI="$SCRATCH/app-install"
+    mkdir -p "$APPI/fake/TableStudio.app/Contents/MacOS" "$APPI/home"
+    printf '#!/bin/sh\n' >"$APPI/fake/TableStudio.app/Contents/MacOS/TableStudio"
+    (cd "$APPI/fake" && ditto -c -k --keepParent TableStudio.app "$APPI/fake.zip")
+    feed() { # feed <file> <build|version|channel>… — a Sparkle feed whose every item is the fake zip
+        local file="$1" item build version channel
+        shift
+        {
+            printf '<?xml version="1.0" standalone="yes"?>\n<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0"><channel>\n'
+            for item in "$@"; do
+                IFS='|' read -r build version channel <<EOF
+$item
+EOF
+                printf '<item><title>%s</title>' "$version"
+                [ -n "$channel" ] && printf '<sparkle:channel>%s</sparkle:channel>' "$channel"
+                printf '<sparkle:version>%s</sparkle:version><sparkle:shortVersionString>%s</sparkle:shortVersionString>' "$build" "$version"
+                printf '<sparkle:minimumSystemVersion>11.0</sparkle:minimumSystemVersion><enclosure url="file://%s" type="application/octet-stream"/></item>\n' "$APPI/fake.zip"
+            done
+            printf '</channel></rss>\n'
+        } >"$file"
+    }
+    install_app() { # install_app <feed> [env…] — install with the app missing, into a scratch path
+        local feed="$1"
+        shift
+        env HOME="$APPI/home" TABLESTUDIO_INSTALL_APP=1 TABLESTUDIO_APPCAST_URL="file://$feed" \
+            TABLESTUDIO_APP_PATH="$APPI/Applications/TableStudio.app" "$@" /bin/bash "$HOOK" install cursor 2>&1
+    }
+
+    feed "$APPI/mixed.xml" '8|2.0.0-beta.1|beta' '7|1.9.0|' '6|1.8.0|'
+    out="$(install_app "$APPI/mixed.xml")"
+    printf '%s' "$out" | grep -q 'Downloading TableStudio 1\.9\.0'
+    report $((1 - $?)) "downloads the newest stable release, not a newer beta" "got: $out"
+    printf '%s' "$out" | grep -q "isn't TableStudio's signed, notarized build" && [ ! -e "$APPI/Applications/TableStudio.app" ]
+    report $((1 - $?)) "refuses a download that isn't TableStudio's notarized build" "got: $out"
+    printf '%s' "$out" | grep -q 'Cursor' && [ -f "$APPI/home/.cursor/plugins/local/tablestudio/.cursor-plugin/plugin.json" ]
+    report $((1 - $?)) "still installs the agent plugin when the app couldn't be" "got: $out"
+
+    feed "$APPI/betas.xml" '5|1.0.0-beta.2|beta' '6|1.0.0-beta.3|beta'
+    out="$(install_app "$APPI/betas.xml")"
+    printf '%s' "$out" | grep -q 'Downloading TableStudio 1\.0\.0-beta\.3'
+    report $((1 - $?)) "downloads the newest beta while there's no stable release" "got: $out"
+
+    out="$(install_app "$APPI/mixed.xml" TABLESTUDIO_INSTALL_APP=0)"
+    printf '%s' "$out" | grep -q "the app isn't installed" && ! printf '%s' "$out" | grep -q 'Downloading'
+    report $((1 - $?)) "TABLESTUDIO_INSTALL_APP=0 leaves the app alone" "got: $out"
+
+    mkdir -p "$APPI/Installed/TableStudio.app"
+    cp "$PREFS" "$APPI/prefs.plist"
+    /usr/bin/plutil -remove mcpServerEnabled "$APPI/prefs.plist"
+    out="$(install_app "$APPI/mixed.xml" TABLESTUDIO_APP_PATH="$APPI/Installed/TableStudio.app" TABLESTUDIO_PREFS="$APPI/prefs.plist")"
+    [ "$(/usr/bin/plutil -extract mcpServerEnabled raw -o - "$APPI/prefs.plist" 2>/dev/null)" = true ] && printf '%s' "$out" | grep -q 'MCP server on'
+    report $((1 - $?)) "turns on the MCP server of an installed app that never set it" "got: $out"
+
+    /usr/bin/plutil -replace mcpServerEnabled -bool false "$APPI/prefs.plist"
+    out="$(install_app "$APPI/mixed.xml" TABLESTUDIO_APP_PATH="$APPI/Installed/TableStudio.app" TABLESTUDIO_PREFS="$APPI/prefs.plist")"
+    [ "$(/usr/bin/plutil -extract mcpServerEnabled raw -o - "$APPI/prefs.plist" 2>/dev/null)" = false ] && printf '%s' "$out" | grep -q 'MCP server is off'
+    report $((1 - $?)) "leaves a server the user turned off alone when nobody's there to ask" "got: $out"
+fi
 
 echo
 echo "$pass passed, $fail failed"

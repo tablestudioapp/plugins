@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.5.9
+
+- **A script written and run in one command is read before it runs.** `cat > fix.py <<'EOF' … EOF; python3 fix.py` was judged by the file on disk, which didn't exist yet, so it got through. The guard now reads what the heredoc writes.
+- **A database named through a variable counts as named.** `psql "$DATABASE_URL" -c "CREATE TABLE …" && psql <production> -c "SELECT …"` was refused as a production write, because the first part's database couldn't be resolved. It now passes when `DATABASE_URL` points at a development database, and env files the command loads (`source app/.env`, `. ./.env`, `--env-file`) are read to find out.
+- **License.** The plugin is back under the [MIT License](LICENSE) instead of PolyForm Shield 1.0.0.
+
+## 0.5.8
+
+- **The shell guard reads what a command runs.** `psql -f fix.sql`, `psql < fix.sql`, `python3 fix.py` and a script fed to an interpreter through a heredoc are judged by the SQL and driver calls inside them, and a script that connects with `DATABASE_URL` is matched through the project's environment. A `.sql` file the guard can't read counts as a write. Before, only the command line was read, so a file sent a write to production straight past it.
+- **SQLite files are recognized however they're written.** A path with spaces (quoted, with `\ ` or `%20`), a `file:` URI, `~`, and, for a file set to Off or Structure only, its name alone, so a glob or a copy is caught too. `cat`, `strings` and `cp` on such a file are refused, since they read its rows as well.
+- **Each part of a command is judged on its own.** A development write next to a production read passes; a part that writes without naming a database (SQL in a heredoc, `export DATABASE_URL=…; prisma migrate deploy`) still counts against every database the command names.
+- The migration reminder no longer fires for text that only quotes a migration command, such as a report written with a heredoc.
+- Skills: `statement_timeout`, a backfill and its `SET NOT NULL` checked together with `statements`, a local copy's login owning its tables, and `list_connections` without `shared_with`.
+
+## 0.5.7
+
+- **The shell guard follows TableStudio's settings, not names.** It knows the user's saved databases, so a command or script that reaches one is matched however it's addressed: a URL, a host or Unix socket with a port and database name, `psql`/`mysql` flags and variables, a Python or Node driver's connect call, or a SQLite file. A database set to Off or Structure only is refused outright, reads included; one tagged production refuses writes even when its name doesn't say so. Before, a production database called `shop` was unprotected, and nothing stopped a script or `sqlite3`.
+- **OpenCode checks shell commands on the tool itself too.** Its permission hook alone didn't see every command, so the guard also runs before each shell call and stops a refused one. Each decision is logged to `~/Library/Logs/TableStudio/opencode-plugin.log`, never with the command.
+- Skills: `preflight_statement` checks schema changes against the real data, `stage_migration` returns the same checks, hand-offs wait in the Inbox instead of opening windows, `er_diagram` returns a link (`open: true` to show it), `list_connections` takes filters, and `request_cleanup` asks the user to delete what an agent made. The local-databases skill says what agents may do with a sandbox: anything inside it, directly, while the source's own level decides what may be copied into one.
+
+## 0.5.6
+
+- **No second TableStudio, and the right one.** Finding TableStudio's MCP server not answering, the plugin opened the app with macOS's default copy, usually the one in /Applications. It did that even while TableStudio was open (busy, say) or restarting (an update, a rebuild in Xcode), so a second, often older copy started beside it and took the agents' port. The plugin now waits for a copy that's open, gives a restart two seconds to come back, and then opens the copy that last ran (TableStudio records where it lives), not just the one in /Applications.
+
+## 0.5.5
+
+- **Updates reach a running Cursor.** Cursor loads Claude Code's copy of this plugin as well as its own, and its one TableStudio MCP server could come from either: often Claude Code's, at whatever version Claude Code had, so Cursor kept running an old plugin after its own was updated, while every hook ran twice. Inside Cursor, any other copy now hands the MCP bridge to Cursor's own and stays out of the hooks. A Cursor that ran 0.5.4 or older needs quitting (⌘Q) and reopening once; closing its windows isn't enough.
+- **The MCP bridge moves to an update by itself.** When an update replaces the plugin under a running bridge (Cursor, OpenCode), it finishes the calls in flight and carries on as the new copy at its next call, in the same session, with no restart.
+- Installing into Cursor copies the plugin beside the old one and swaps it in whole, so a running Cursor never reads a half-written copy.
+- Installing into Claude Code also updates older installs made for one repo only, which otherwise stay recorded at their old version.
+- Doctor shows Cursor's plugin version, and says when Cursor also loads an older Claude Code copy.
+
+## 0.5.4
+
+- **Cursor loads the database-workflow skill again.** Its description had an unquoted colon, which strict YAML readers (Cursor's) reject, so Cursor listed only the other two skills while the rules told agents to follow this one.
+- The skills match what the tools now do: `describe_capabilities` only when `list_connections` doesn't already answer it, a `local_server.warning` for a stopped server whose port another server holds, `already_fast` only when no index is proven, hypopg installed only on development databases, and log search across a Homebrew service's own log.
+
+## 0.5.3
+
+- **When TableStudio is slow, agents still connect.** The header script and session note used to take a slow answer from TableStudio (a busy Mac) for a closed app, then open it and wait, long enough that Claude Code gave up on the token and showed an OAuth "Dynamic Client Registration" error instead. A slow app now gets the token straight away, and the session note says TableStudio is busy rather than missing.
+- **No folder open.** From the home folder or `/` (Cursor's empty window, a terminal in `~`), the session note no longer reports a project a few levels down as this one, and it's fast again. When TableStudio's saved databases can't be read, the note still says when its tools aren't reachable and how to fix it.
+- **The Cursor bridge runs calls side by side**, so a long check no longer holds up the calls behind it.
+- The session note only says to `use_database` "with the id shown" when it shows one.
+- Skills and rules cover the new list arguments (`schema_issues` `tables`, `optimize_query` `queries`, `start_local_database` `instance_ids`, `add_extension` `names`), never mirroring a sandbox, opt-in migrate scripts, `pg_stat_statements` and `hypopg` blocked answers, `agent_changes`, and a server on the wrong port. Reads are `read_query` everywhere, including the rules and the migration reminder. The Cursor rule says what to do when Cursor starts a chat before the session note arrives.
+
+## 0.5.2
+
+- **One command installs everything.** `curl -fsSL https://tablestudio.sh/install | bash` now installs TableStudio itself when it isn't on the Mac: the newest release from its update feed (the newest beta until there's a stable one), checked to be TableStudio's own signed, notarized build before it's put in `/Applications`. It turns the MCP server on, asks which of the agents it found to install into (Enter for all), and opens TableStudio, so the agent has its tools from the first session. Without a terminal to ask, it goes ahead with all of them, and never turns back on an MCP server the user turned off. `TABLESTUDIO_INSTALL_APP=0` skips the app.
+- When TableStudio isn't installed, doctor and the session note give that command instead of the website.
+- **After the trial**, the session note and doctor say TableStudio's free trial has ended, with where to buy and how to enter a key, instead of offering tools that only return that notice. Needs the TableStudio update that keeps its MCP server answering after the trial (it reports the license at `/license`); with an older app nothing changes.
+
 ## 0.5.1
 
 - Every call carries the plugin's version, so TableStudio's Agent Center shows each agent's plugin version and offers an update only to the agents that need one.

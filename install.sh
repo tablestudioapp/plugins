@@ -1,12 +1,14 @@
 #!/bin/bash
-# Installs the TableStudio plugin into the coding agents on this Mac: Claude Code, Cursor, Codex
-# and OpenCode. Every one it finds, or just the ones you name.
+# Installs TableStudio (when it's missing, with its MCP server on) and its plugin into the coding
+# agents on this Mac: Claude Code, Cursor, Codex and OpenCode. The ones you name, else the ones it
+# finds, asking which at a terminal.
 #
 #   ./install.sh                     from a checkout of this repository
 #   ./install.sh cursor opencode     only these
 #   curl -fsSL https://tablestudio.sh/install | bash
 #
 # Run it again to update. It ends with a check of what's set up (also: ./install.sh --doctor).
+# TABLESTUDIO_INSTALL_APP=0 never installs the app.
 
 REPO="https://github.com/tablestudioapp/plugins.git"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"

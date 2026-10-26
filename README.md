@@ -13,15 +13,15 @@ Your coding agent works on your databases through [TableStudio](https://tablestu
 
 ## Install
 
-You need TableStudio for macOS with its MCP server on (**Settings → MCP**).
+The plugin works through TableStudio for macOS with its MCP server on (**Settings → MCP**).
 
-**Everything at once.** Installs into every agent it finds on your Mac, then checks the setup:
+**Everything at once.** Installs TableStudio itself if it isn't on your Mac yet (the notarized build from its update feed, with the MCP server on), asks which of the agents it finds to install into, opens TableStudio and checks the setup:
 
 ```sh
 curl -fsSL https://tablestudio.sh/install | bash
 ```
 
-Or from a checkout: `./install.sh` (all), `./install.sh cursor opencode` (some), `./install.sh --doctor` (just check). Run it again to update.
+Without a terminal to ask (an agent running it for you), it installs into every agent it finds. `TABLESTUDIO_INSTALL_APP=0` skips installing the app. Or from a checkout: `./install.sh` (all), `./install.sh cursor opencode` (some), `./install.sh --doctor` (just check). Run it again to update.
 
 Or per agent:
 
@@ -170,4 +170,4 @@ Work goes to `staging`. `main` is what users install, and every merge into it is
 
 ## License
 
-[PolyForm Shield 1.0.0](LICENSE): use, change and share it for anything except a product that competes with TableStudio.
+[MIT](LICENSE)

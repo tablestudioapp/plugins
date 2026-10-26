@@ -10,11 +10,11 @@ TableStudio manages database servers on this Mac, including ones it adopted from
 ## "Connection refused" on a local database
 
 1. `connection_status` (no arguments reports every connection). It runs no query, so it works while the database is down, and it tells you whether a local server backs the connection and whether that server is running.
-2. If the server is stopped, call `start_local_database` with the `instance_id` it returned. It's safe to call when the server is already running.
+2. If the server is stopped, call `start_local_database` with the `instance_id` it returned (several servers: `instance_ids`, in one call). It's safe to call when the server is already running.
 3. If the port is taken by something else, the error names the occupant. Tell the user rather than killing processes.
-4. If it still won't start, `search_server_log` with its `instance_id` (and a pattern like `FATAL`) shows why, without reading the log file yourself.
+4. If it still won't start, `search_server_log` with its `instance_id` (and a pattern like `FATAL`) shows why, without reading the log file yourself. It reads every file the server logs to, a Homebrew service's own log included, and `ERROR|FATAL` matches either.
 
-`list_connections` already says, for each local database, whether its server is running (`local_server.running`) and which other saved databases share that server. `list_local_databases` adds what has no saved connection: adopted servers, SQLite files, and servers TableStudio doesn't manage that hold a port. Note the two ids: `instance_id` is the server (start and stop take it), and `connection_id` is the database you query. They aren't interchangeable, and a server holding several databases lists each one's `connection_id` under `connections`.
+`list_connections` already says, for each local database, whether its server is running (`local_server.running`), whether it's up on the wrong port (`local_server.warning`), and which other saved databases share that server. `list_local_databases` adds what has no saved connection: adopted servers, SQLite files, and servers TableStudio doesn't manage that hold a port. Note the two ids: `instance_id` is the server (start and stop take it), and `connection_id` is the database you query. They aren't interchangeable, and a server holding several databases lists each one's `connection_id` under `connections`.
 
 ## A new database
 
@@ -34,6 +34,8 @@ Never repeat the connection string in chat, and never write it into code, docs o
 
 Don't call `stop_local_database` as cleanup or to free a port unless the user asked. It disconnects everything using that server, including the user's own windows.
 
+When you're done with local databases or backup files you made for a task, `request_cleanup` with their `connection_ids` and `backup_ids` asks the user to delete them: one request in TableStudio's Inbox, and nothing is removed until they confirm. Sandboxes go with `remove_sandbox` instead.
+
 ## A local copy of a remote or production database
 
 When the user wants to develop against a copy of a real database ("make me a local copy of production"), make a real local database and restore a full backup into it. Not `create_sandbox`: a sandbox is a throwaway copy on TableStudio's shared sandbox server, capped at `rows` rows per table, for experiments.
@@ -42,7 +44,7 @@ When the user wants to develop against a copy of a real database ("make me a loc
 2. Before copying, say what it means: production data, customer data included, ends up on this Mac. If they'd rather have less, offer the schema only, or a sample (that's when a sandbox fits).
 3. The local database: `create_local_database` named after the project, with the `instance_id` of a running local server of the same engine when there is one.
 4. `backup_database` on the source (keep the default format), then `restore_backup` with that `backup_id` and the new database's `connection_id`. Into an empty database it runs best-effort and reports what the local server couldn't create (`left_out`, `skipped`): tell the user. A big database may come back `running`; `list_backups` shows when it's done. For a different engine, use `migrate_database_check`, then `migrate_database`, instead.
-5. Point the project at it: `env_line` from `create_local_database` (or `get_connection_url`), in the project's gitignored env file, under the variable the project reads. If that file holds the production URL, say you're replacing it and keep the old line commented out, or put the local one in the file the framework reads for local overrides.
+5. Point the project at it: `env_line` from `create_local_database` (or `get_connection_url`). Its login is the database's own and owns everything in it, the restored tables included, so the project's migration tool can change them; it can't read the server's other databases. Put it in the project's gitignored env file, under the variable the project reads. If that file holds the production URL, say you're replacing it and keep the old line commented out, or put the local one in the file the framework reads for local overrides.
 6. The copy already has production's schema. Run the project's migrations only to bring it up to code that isn't deployed yet.
 
 ## The connection string of an existing local database
@@ -63,6 +65,12 @@ When the project needs to reach a local database TableStudio already knows (to f
 
 Run whatever you like against the sandbox's `connection_id`. `remove_sandbox` deletes it when you're done (sandboxes only), and `list_sandboxes` finds one you made earlier. A sandbox isn't a project's local database: for that, see "A local copy of a remote or production database" above.
 
+What you may do with a sandbox:
+
+- **In it, anything.** A sandbox is Read & write for agents whatever its source is tagged: writes and DDL run directly with `execute_query`, with no staging and no review, even when it's a copy of production. Nothing you do there reaches the source.
+- **What you may copy is the source's call.** From a database set to Read or Read & write, any `data`. From one set to Structure only, only `data: "none"`: its rows aren't for agents, so `sample` and `fake` (which learns the source's values) are refused. A database set to Off can't be copied at all.
+- A `sample` of production is real data, customer data included, now on this Mac. Say so before making one, and offer `none` or `fake` when the schema is what matters.
+
 ## PostgreSQL extensions
 
-`list_extensions` shows what the server can install and what's already installed. `add_extension` installs one (`CREATE EXTENSION IF NOT EXISTS`). Treat it as a schema change: on a shared or production database, propose it rather than running it. And if the repo has a migration tool, add it there so other environments get it too.
+`list_extensions` shows what's installed; `pattern: "vector"` answers whether one is available, and `include_available: true` lists the whole catalog. An extension marked `needs_preload` with `preloaded: false` is installed but doesn't work until its library is in `shared_preload_libraries` and the server restarts: tell the user. `add_extension` installs one, or several with `names` (`CREATE EXTENSION IF NOT EXISTS`). Treat it as a schema change: on a shared or production database, propose it rather than running it. And if the repo has a migration tool, add it there so other environments get it too.

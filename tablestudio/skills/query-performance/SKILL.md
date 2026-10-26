@@ -12,7 +12,7 @@ Pick the connection first, as described in the database-workflow skill. Prefer r
 ## Find what's slow
 
 - **The user names a query or an endpoint:** find the SQL it runs (from the code or the ORM's logging), then go to "Diagnose one statement".
-- **"Why is the database slow?"** Call `slow_queries`. It ranks statements by total time from `pg_stat_statements`. Keep each row's `query_id`; the other tools accept it. If the extension isn't installed, the tool explains what enabling it involves, so pass that on rather than installing it unasked.
+- **"Why is the database slow?"** Call `slow_queries`. It ranks statements by total time from `pg_stat_statements`. Keep each row's `query_id`; the other tools accept it. When `pg_stat_statements` can't be read, `slow_queries`, `workload_index_advisor` and `index_what_if` (without `sql`) all return the same `blocked` answer: `pg_stat_statements_not_installed`, or `pg_stat_statements_not_preloaded` (installed, but its library isn't in `shared_preload_libraries`), with `restart_required` and `how_to_enable`. Pass that on rather than installing or restarting anything unasked. When `fixable_in_tablestudio` is true, the user can do it from the database's Dashboard in one click.
 - **Broad tuning:** `workload_index_advisor` finds the fewest indexes that cover the most database time, and lists existing indexes that are never used.
 
 ## What's running right now
@@ -30,11 +30,13 @@ Put the findings that matter most first, in plain language: what's wrong, what i
 
 ## Diagnose one statement
 
-1. `optimize_query` with the SQL (and `query_id` if it came from `slow_queries`). For a read-only statement, pass `analyze: true` so the measured checks can run. It executes once inside a rolled-back transaction. It reports `already_fast` when there's nothing worth doing; say so instead of inventing an improvement.
+1. `optimize_query` with the SQL (and `query_id` if it came from `slow_queries`). For a read-only statement, pass `analyze: true` so the measured checks can run. It executes once inside a rolled-back transaction. It reports `already_fast` (under 2 ms a run, and no index proven to help) when there's nothing worth doing; say so instead of inventing an improvement. Several statements, such as the top rows of `slow_queries`, go in one call as `queries`: each comes back with its verdict, findings and `proven_indexes`, and `verdicts` counts them.
 2. For more detail, use `explain_query` (`analyze: true` for reads only). Compare `actual_rows` with `estimated_rows` on each node. A large gap means stale statistics (`ANALYZE` the table), which is often the real bug rather than a missing index.
 3. A statement with `$1, $2` placeholders needs real values to plan honestly. `suggest_parameter_values` finds them from history, live sessions and statistics.
 
 ## Prove the fix
+
+Proving an index without building it needs the `hypopg` extension. When it's missing, `optimize_query` lists the index checks under `checks.needs_hypopg` (they didn't run, so `already_fast` or `healthy` says nothing about indexes), and `index_what_if` and the index variants of `benchmark_query_variants` return `blocked: hypopg_not_installed`. Unlike pg_stat_statements it needs no restart: `add_extension` with `hypopg` installs it on a development database; on a database tagged production, propose it with `stage_migration` instead. Or test on a sandbox: there `benchmark_query_variants` builds each hypothetical index for real inside a rolled-back transaction, so it needs no hypopg. A sample's timings aren't the real table's, so compare plans more than milliseconds.
 
 Use `benchmark_query_variants` (the Query Lab) before recommending anything:
 
