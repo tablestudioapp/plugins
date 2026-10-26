@@ -984,10 +984,10 @@ describe_migration_tooling() {
     found="$(first -type f -name 'schema.prisma')"
     [ -n "$found" ] || found="$(first -type d -path '*prisma/schema')"
     if [ -n "$found" ]; then
-        printf -- '- Prisma (%s). New migration: npx prisma migrate dev --name <change>\n' "$found"
+        printf -- '- Prisma (%s). New migration: prisma migrate dev --name <change>\n' "$found"
     fi
     found="$(first -type f \( -name 'drizzle.config.ts' -o -name 'drizzle.config.js' -o -name 'drizzle.config.mjs' -o -name 'drizzle.config.cjs' -o -name 'drizzle.config.json' \))"
-    [ -n "$found" ] && printf -- '- Drizzle Kit (%s). New migration: npx drizzle-kit generate\n' "$found"
+    [ -n "$found" ] && printf -- '- Drizzle Kit (%s). New migration: drizzle-kit generate\n' "$found"
     if has db/migrate && has Gemfile; then
         printf -- '- Rails (db/migrate). New migration: bin/rails generate migration <Name>\n'
     fi
@@ -1000,15 +1000,15 @@ describe_migration_tooling() {
     fi
     has supabase/migrations && printf -- '- Supabase CLI (supabase/migrations). New migration: supabase migration new <name>\n'
     found="$(first -type f \( -name 'knexfile.js' -o -name 'knexfile.ts' -o -name 'knexfile.cjs' -o -name 'knexfile.mjs' \))"
-    [ -n "$found" ] && printf -- '- Knex (%s). New migration: npx knex migrate:make <name>\n' "$found"
-    has .sequelizerc && printf -- '- Sequelize (.sequelizerc). New migration: npx sequelize-cli migration:generate --name <name>\n'
+    [ -n "$found" ] && printf -- '- Knex (%s). New migration: knex migrate:make <name>\n' "$found"
+    has .sequelizerc && printf -- '- Sequelize (.sequelizerc). New migration: sequelize-cli migration:generate --name <name>\n'
     has priv/repo/migrations && printf -- '- Ecto (priv/repo/migrations). New migration: mix ecto.gen.migration <name>\n'
     if has package.json && grep -q '"typeorm"' "$dir/package.json" 2>/dev/null; then
-        printf -- '- TypeORM. New migration: npx typeorm migration:generate (check package.json scripts first)\n'
+        printf -- '- TypeORM. New migration: typeorm migration:generate (check package.json scripts first)\n'
     fi
     found="$(first -type f \( -name 'wrangler.toml' -o -name 'wrangler.json' -o -name 'wrangler.jsonc' \))"
     if [ -n "$found" ] && grep -q 'd1_databases' "$dir/$found" 2>/dev/null; then
-        printf -- '- Cloudflare D1 (%s). New migration: npx wrangler d1 migrations create <db> <name>\n' "$found"
+        printf -- '- Cloudflare D1 (%s). New migration: wrangler d1 migrations create <db> <name>\n' "$found"
     fi
     local sqldir
     for sqldir in db/migrations migrations sql/migrations database/migrations; do

@@ -2,7 +2,8 @@
 
 ## 0.5.10
 
-- **Ready for Anthropic's plugin directory.** The hook script's quoting is written the way every shell reads it, so the directory's checks can follow it, and the Claude Code manifest links the [privacy policy](https://tablestudio.sh/legal/privacy). Nothing changes in what the plugin does.
+- **Ready for Anthropic's plugin directory.** The hook script's quoting is written the way every shell reads it, so the directory's checks can follow it, and the Claude Code manifest links the [privacy policy](https://tablestudio.sh/legal/privacy).
+- The session note gives each migration tool's command without `npx` in front (`prisma migrate dev`, `wrangler d1 migrations create`), so the agent runs it the way the project does: npx, pnpm, yarn or bun.
 
 ## 0.5.9
 
