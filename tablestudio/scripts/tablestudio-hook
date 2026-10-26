@@ -927,7 +927,7 @@ describe_setting() {
 
     case "$value" in
         \$\{*\} | \$[A-Za-z_]*)
-            local ref="${value#\$}"; ref="${ref#\{}"; ref="${ref%\}}"
+            local ref; ref=${value#\$}; ref=${ref#\{}; ref=${ref%\}}
             printf 'refers to %s%s' "$ref" "$prod"
             return 0 ;;
     esac
@@ -1212,7 +1212,7 @@ GUARD_SAVED_NET
 # also counts by its name alone: a glob, a copy or `cd` there and back still reaches it.
 sqlite_hits() {
     local text="$1" dir="$2" relative id name kind shost sport sdb env project ro file d1 access base
-    text="${text//\\ / }"; text="${text//%20/ }"; text="${text//\~\//$HOME/}"
+    text=${text//\\ / }; text=${text//%20/ }; text=${text//\~\//"$HOME"/}
     relative="$(printf '%s' "$text" | grep -Eo '[^[:space:]"'"'"'`(),=]+\.(sqlite3?|db)' | sed -E 's#^file:(//)?##' | sort -u | while IFS= read -r file; do
         case "$file" in /*) ;; *) printf '%s/%s\n' "$dir" "$file" ;; esac
     done)"
